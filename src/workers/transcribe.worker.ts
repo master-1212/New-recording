@@ -24,7 +24,9 @@ self.onmessage = async ({ data }: MessageEvent<{ audio: Float32Array }>) => {
   try {
     self.postMessage({ type: "status", status: "Loading local Whisper model…", progress: 0.03 });
     if (!transcriber) {
-      const moduleUrl = "/runtime/ml-kernel.js";
+      // Use the package's declared standalone CDN build. The +esm and
+      // transformers.web.js entries leave bare ONNX imports in Safari workers.
+      const moduleUrl = "/runtime/ml-kernel-v3.js";
       const transformers = (await import(/* webpackIgnore: true */ moduleUrl)) as TransformersModule;
       transformers.env.allowLocalModels = false;
       transformers.env.useBrowserCache = true;
@@ -52,8 +54,6 @@ self.onmessage = async ({ data }: MessageEvent<{ audio: Float32Array }>) => {
       return_timestamps: "word",
       chunk_length_s: 30,
       stride_length_s: 5,
-      language: "en",
-      task: "transcribe",
     });
     const words: TranscriptWord[] = (result.chunks ?? []).flatMap((chunk) => {
       const [start, rawEnd] = chunk.timestamp;

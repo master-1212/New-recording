@@ -3,7 +3,7 @@ const assets: Record<string, string> = {
   "processor.js": "https://cdn.jsdelivr.net/npm/@sapphi-red/web-noise-suppressor@0.3.5/rnnoiseWorklet.js",
   "core.wasm": "https://cdn.jsdelivr.net/npm/@sapphi-red/web-noise-suppressor@0.3.5/rnnoise.wasm",
   "core-simd.wasm": "https://cdn.jsdelivr.net/npm/@sapphi-red/web-noise-suppressor@0.3.5/rnnoise_simd.wasm",
-  "ml-kernel.js": "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.6/+esm",
+  "ml-kernel-v3.js": "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.6/dist/transformers.min.js",
 };
 
 export async function GET(_request: Request, context: { params: Promise<{ asset: string }> }) {
