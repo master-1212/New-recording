@@ -18,6 +18,18 @@ export type EnhanceSettings = {
   gain: number;
 };
 
+export type FocusSettings = {
+  voiceOnly: boolean;
+  neuralDenoise: number;
+  noiseFloor: number | null;
+};
+
+export type TranscriptWord = {
+  text: string;
+  start: number;
+  end: number;
+};
+
 export type LiveMetrics = {
   speech: number;
   peak: number;

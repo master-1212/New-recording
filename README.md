@@ -8,6 +8,7 @@ Transport playback supports 0.5×–2× speed with pitch preservation, ±10-seco
 
 - `src/hooks/useAudioEngine.ts` owns decoding, transport synchronization, the Web Audio graph, and DSP state.
 - `src/workers/analyze.worker.ts` creates bounded-resolution waveform, log-frequency spectral, level, dominant-frequency, and voice-activity data off the UI thread.
+- `src/workers/transcribe.worker.ts` lazily loads Whisper in a dedicated worker and returns clickable word-level timestamps without uploading the recording.
 - `src/components/Spectrogram3D.tsx` renders only a playback-centered spectral window on the GPU. Orbit controls provide mouse/touch rotation, pinch zoom, and pan.
 - `src/components/Overview.tsx` draws both a zoomed waveform synchronized to the 3D visible window and the full-recording heatmap, waveform, VAD, and seek cursor.
 
@@ -17,11 +18,17 @@ Audio is decoded once and mixed to mono for analysis. The worker caps the overvi
 
 ## Voice Enhance DSP
 
-The enhanced branch uses an adjustable high-pass filter, low-shelf attenuation, 2.7 kHz presence EQ, soft-knee compressor, makeup gain, and the browser output limiter. A parallel dry branch makes the A/B transition immediate and click-free. The shared master stage supports 0–500% gain and feeds a fast limiter to reduce clipping at high boost. Suppression is conservative because Version 1 has no server-side neural denoiser.
+The enhanced branch uses an adjustable high-pass filter, low-shelf attenuation, 2.7 kHz presence EQ, soft-knee compressor, makeup gain, an adaptive learned-noise gate, and the browser output limiter. A parallel dry branch makes the A/B transition immediate and click-free. The shared master stage supports 0–500% gain and feeds a fast limiter to reduce clipping at high boost.
+
+Speech Focus applies a strong intelligibility preset and enables a 70% RNNoise blend. RNNoise runs as a local WASM `AudioWorklet`; the slider crossfades it with the unprocessed signal. Learn Noise Profile samples a quiet five-second region around the playhead and uses that level to attenuate low-likelihood background sound. Voice-only playback uses the VAD timeline to skip sustained non-speech sections.
+
+## Local Whisper transcription
+
+Whisper transcription is opt-in. On first use, the browser downloads the quantized `whisper-tiny.en_timestamped` model and caches it; inference then runs locally on 16 kHz audio in a Web Worker. Words are timestamped and can be tapped to seek. Audio is never sent to the CDN or model host: those services provide code/model assets only. A small same-origin Vercel route proxies and caches allowlisted runtime assets so Safari content blockers do not have to permit third-party executable files; it never accepts or transmits user audio. An internet connection is required the first time RNNoise or Whisper is enabled.
 
 ## Browser compatibility
 
-Designed for current Safari on iPad/iPhone and current Safari, Chrome, Edge, and Firefox on desktop. Codec support is supplied by the browser/OS; WAV and MP3 are the most portable. iOS requires a user gesture before audio starts. Very large compressed recordings may hit Safari's decode-memory ceiling because `decodeAudioData` does not stream.
+Designed for current Safari on iPad/iPhone and current Safari, Chrome, Edge, and Firefox on desktop. Codec support is supplied by the browser/OS; WAV and MP3 are the most portable. iOS requires a user gesture before audio starts. Very large compressed recordings may hit Safari's decode-memory ceiling because `decodeAudioData` does not stream. Local Whisper is demanding on older iPads, and a tiny English model trades accuracy for memory and speed—especially on severely muffled speech.
 
 ## Local development
 
@@ -44,4 +51,6 @@ No backend or environment variables are required. Import the repository into Ver
 
 ## Known limitations and roadmap
 
-Version 1 performs voice activity detection, not identity recognition. VAD is an energy, spectral-ratio, and zero-crossing estimate and may classify music as voice. Neural enhancement, transcription, word timestamps, speaker diarization, export, spectral editing, pitch/formant/harmonic tools, and voice comparison are future capabilities and are not represented as implemented.
+VAD is an energy, spectral-ratio, and zero-crossing estimate and may classify music as voice, so voice-only playback can occasionally skip very faint speech. RNNoise reduces stationary noise but cannot reconstruct words that were never captured. Whisper currently transcribes English only and its output must be treated as an aid, not forensic proof.
+
+Speaker diarization is intentionally not shown. VoiceScope does not yet ship a sufficiently reliable local speaker-embedding model, and assigning guessed Speaker 1/2 labels would be misleading. Reliable diarization, multilingual models, export, spectral editing, pitch/formant/harmonic tools, and voice comparison remain roadmap items.
