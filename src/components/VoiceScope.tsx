@@ -3,7 +3,7 @@
 import { useRef, useState } from "react";
 import { Activity, AudioLines, ChevronRight, Gauge, Info, LockKeyhole, Pause, Play, Repeat2, RotateCcw, SlidersHorizontal, Sparkles, Upload, Volume2, Waves } from "lucide-react";
 import { Spectrogram3D } from "./Spectrogram3D";
-import { Overview } from "./Overview";
+import { Overview, WindowWaveform } from "./Overview";
 import { KnobSlider } from "./KnobSlider";
 import { useAudioEngine } from "@/hooks/useAudioEngine";
 import { db, formatTime } from "@/lib/format";
@@ -43,6 +43,11 @@ export function VoiceScope() {
           <label><span>RELIEF DEPTH <b>{Math.round(depth * 100)}%</b></span><input type="range" min="0.2" max="1.5" step="0.05" value={depth} onChange={(e) => setDepth(Number(e.target.value))}/></label>
         </div>
 
+        <div className="window-waveform-wrap">
+          <div className="overview-labels"><span>VISIBLE WINDOW · WAVEFORM DETAIL</span><span>{windowSeconds}s</span></div>
+          <WindowWaveform analysis={engine.analysis} currentTime={engine.currentTime} duration={engine.duration} windowSeconds={windowSeconds} onSeek={engine.seek}/>
+        </div>
+
         <div className="overview-wrap">
           <div className="overview-labels"><span>FULL RECORDING · HEATMAP + WAVEFORM</span><span>{formatTime(engine.duration)}</span></div>
           <Overview analysis={engine.analysis} currentTime={engine.currentTime} duration={engine.duration} onSeek={engine.seek}/>
@@ -52,9 +57,9 @@ export function VoiceScope() {
         <section className="transport">
           <div className="time-readout"><b>{formatTime(engine.currentTime)}</b><span>/ {formatTime(engine.duration)}</span></div>
           <div className="transport-buttons"><button aria-label="Back ten seconds" onClick={() => engine.skip(-10)}><RotateCcw/><span>10</span></button><button className="play" aria-label={engine.playing ? "Pause" : "Play"} onClick={engine.playPause} disabled={!ready}>{engine.playing ? <Pause/> : <Play/>}</button><button aria-label="Forward ten seconds" onClick={() => engine.skip(10)}><RotateCcw className="forward"/><span>10</span></button></div>
-          <label className="rate"><span>SPEED</span><select value={rate} onChange={(e) => { const v = Number(e.target.value); setRateValue(v); engine.setRate(v); }}><option>.75×</option><option value="1">1×</option><option>1.25×</option><option>1.5×</option><option>2×</option></select></label>
+          <label className="rate"><span>SPEED</span><select value={rate} onChange={(e) => { const v = Number(e.target.value); setRateValue(v); engine.setRate(v); }}><option value="0.5">.5×</option><option value="0.75">.75×</option><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
           <button className={loop ? "icon-button active" : "icon-button"} onClick={() => { setLoopValue(!loop); engine.setLoop(!loop); }} aria-label="Loop"><Repeat2/></button>
-          <label className="volume"><Volume2/><input type="range" min="0" max="1" step=".02" value={volume} onChange={(e) => { const v = Number(e.target.value); setVolumeValue(v); engine.setVolume(v); }}/></label>
+          <label className={volume > 1 ? "volume boosted" : "volume"} title="Master gain is protected by a limiter"><Volume2/><span>{Math.round(volume * 100)}%</span><input aria-label="Master volume" type="range" min="0" max="5" step=".05" value={volume} onChange={(e) => { const v = Number(e.target.value); setVolumeValue(v); engine.setVolume(v); }}/></label>
         </section>
       </section>
 

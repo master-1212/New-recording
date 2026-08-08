@@ -2,12 +2,14 @@
 
 VoiceScope 3D is an iPad-first, private audio-analysis workstation built with Next.js, TypeScript, React Three Fiber, WebGL, Web Audio, and a Web Worker. Recordings stay in the browser.
 
+Transport playback supports 0.5×–2× speed with pitch preservation, ±10-second navigation, looping, overview seeking, and limiter-protected master gain up to 500%.
+
 ## Architecture
 
 - `src/hooks/useAudioEngine.ts` owns decoding, transport synchronization, the Web Audio graph, and DSP state.
 - `src/workers/analyze.worker.ts` creates bounded-resolution waveform, log-frequency spectral, level, dominant-frequency, and voice-activity data off the UI thread.
 - `src/components/Spectrogram3D.tsx` renders only a playback-centered spectral window on the GPU. Orbit controls provide mouse/touch rotation, pinch zoom, and pan.
-- `src/components/Overview.tsx` draws the full-recording heatmap, waveform, VAD, and seek cursor on one canvas.
+- `src/components/Overview.tsx` draws both a zoomed waveform synchronized to the 3D visible window and the full-recording heatmap, waveform, VAD, and seek cursor.
 
 ## Spectrogram and performance
 
@@ -15,7 +17,7 @@ Audio is decoded once and mixed to mono for analysis. The worker caps the overvi
 
 ## Voice Enhance DSP
 
-The enhanced branch uses an adjustable high-pass filter, low-shelf attenuation, 2.7 kHz presence EQ, soft-knee compressor, makeup gain, and the browser output limiter. A parallel dry branch makes the A/B transition immediate and click-free. Suppression is conservative because Version 1 has no server-side neural denoiser.
+The enhanced branch uses an adjustable high-pass filter, low-shelf attenuation, 2.7 kHz presence EQ, soft-knee compressor, makeup gain, and the browser output limiter. A parallel dry branch makes the A/B transition immediate and click-free. The shared master stage supports 0–500% gain and feeds a fast limiter to reduce clipping at high boost. Suppression is conservative because Version 1 has no server-side neural denoiser.
 
 ## Browser compatibility
 

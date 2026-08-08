@@ -33,3 +33,46 @@ export function Overview({ analysis, currentTime, duration, onSeek }: { analysis
   }, [analysis, currentTime, duration]);
   return <canvas ref={canvasRef} className="overview-canvas" aria-label="Waveform and spectrogram overview. Tap to seek." onPointerDown={(e) => { const r = e.currentTarget.getBoundingClientRect(); onSeek((e.clientX - r.left) / r.width * duration); }}/>
 }
+
+export function WindowWaveform({ analysis, currentTime, duration, windowSeconds, onSeek }: { analysis: AnalysisData | null; currentTime: number; duration: number; windowSeconds: number; onSeek: (v: number) => void }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const halfWindow = windowSeconds / 2;
+  const windowStart = Math.max(0, currentTime - halfWindow);
+  const windowEnd = Math.min(duration, currentTime + halfWindow);
+
+  useEffect(() => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const rect = canvas.getBoundingClientRect(), ratio = Math.min(2, devicePixelRatio || 1);
+    canvas.width = Math.max(1, rect.width * ratio); canvas.height = Math.max(1, rect.height * ratio);
+    const ctx = canvas.getContext("2d"); if (!ctx) return;
+    ctx.scale(ratio, ratio); const w = rect.width, h = rect.height;
+    ctx.fillStyle = "#081311"; ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = "#132a26"; ctx.lineWidth = 1;
+    for (let i = 1; i < 6; i++) { const x = i / 6 * w; ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke(); }
+    ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
+    if (!analysis || windowEnd <= windowStart) return;
+
+    const span = windowEnd - windowStart;
+    for (let x = 0; x < Math.ceil(w); x++) {
+      const time = windowStart + x / w * span;
+      const col = Math.min(analysis.columns - 1, Math.max(0, Math.floor(time / analysis.duration * analysis.columns)));
+      if (analysis.speech[col] > 0.5) {
+        ctx.fillStyle = `rgba(111,241,207,${0.04 + analysis.speech[col] * 0.11})`;
+        ctx.fillRect(x, 0, 1.5, h);
+      }
+      const low = analysis.waveform[col * 2], high = analysis.waveform[col * 2 + 1];
+      ctx.strokeStyle = analysis.speech[col] > 0.5 ? "#89f6d8" : "#3f8f7e";
+      ctx.globalAlpha = 0.9; ctx.beginPath();
+      ctx.moveTo(x, h / 2 + low * h * 0.44); ctx.lineTo(x, h / 2 + high * h * 0.44); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    const cursor = (currentTime - windowStart) / span * w;
+    ctx.fillStyle = "#ffc85a"; ctx.fillRect(cursor - 1, 0, 2, h);
+  }, [analysis, currentTime, windowStart, windowEnd]);
+
+  return <canvas ref={canvasRef} className="window-canvas" aria-label={`Waveform detail for the visible ${windowSeconds} second window. Tap to seek.`} onPointerDown={(e) => {
+    if (windowEnd <= windowStart) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    onSeek(windowStart + (e.clientX - rect.left) / rect.width * (windowEnd - windowStart));
+  }}/>
+}

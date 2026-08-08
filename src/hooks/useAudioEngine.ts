@@ -10,6 +10,8 @@ export function useAudioEngine(settings: EnhanceSettings) {
   const contextRef = useRef<AudioContext | null>(null);
   const wetGainRef = useRef<GainNode | null>(null);
   const dryGainRef = useRef<GainNode | null>(null);
+  const masterGainRef = useRef<GainNode | null>(null);
+  const volumeValueRef = useRef(0.9);
   const filtersRef = useRef<{ highpass: BiquadFilterNode; low: BiquadFilterNode; presence: BiquadFilterNode; comp: DynamicsCompressorNode; gain: GainNode } | null>(null);
   const urlRef = useRef<string | null>(null);
   const frameRef = useRef(0);
@@ -60,16 +62,20 @@ export function useAudioEngine(settings: EnhanceSettings) {
     if (!audio) return;
     const context = new AudioContext();
     const source = context.createMediaElementSource(audio);
-    const dry = context.createGain(), wet = context.createGain();
+    const dry = context.createGain(), wet = context.createGain(), master = context.createGain();
     const highpass = context.createBiquadFilter(); highpass.type = "highpass";
     const low = context.createBiquadFilter(); low.type = "lowshelf"; low.frequency.value = 230;
     const presence = context.createBiquadFilter(); presence.type = "peaking"; presence.frequency.value = 2700; presence.Q.value = 0.75;
     const comp = context.createDynamicsCompressor(); comp.attack.value = 0.008; comp.release.value = 0.18; comp.knee.value = 12;
     const gain = context.createGain();
-    source.connect(dry).connect(context.destination);
-    source.connect(highpass).connect(low).connect(presence).connect(comp).connect(gain).connect(wet).connect(context.destination);
+    const limiter = context.createDynamicsCompressor();
+    limiter.threshold.value = -1; limiter.knee.value = 0; limiter.ratio.value = 20; limiter.attack.value = 0.002; limiter.release.value = 0.08;
+    source.connect(dry).connect(master);
+    source.connect(highpass).connect(low).connect(presence).connect(comp).connect(gain).connect(wet).connect(master);
+    master.connect(limiter).connect(context.destination);
     dry.gain.value = 1; wet.gain.value = 0;
-    contextRef.current = context; wetGainRef.current = wet; dryGainRef.current = dry;
+    master.gain.value = volumeValueRef.current;
+    contextRef.current = context; wetGainRef.current = wet; dryGainRef.current = dry; masterGainRef.current = master;
     filtersRef.current = { highpass, low, presence, comp, gain };
   }, []);
 
@@ -113,8 +119,17 @@ export function useAudioEngine(settings: EnhanceSettings) {
   useEffect(() => () => { if (urlRef.current) URL.revokeObjectURL(urlRef.current); contextRef.current?.close(); }, []);
 
   return { audioRef, fileName, duration, currentTime, playing, analysis, progress, error, metrics, loadFile, playPause, seek, skip,
-    setRate: (v: number) => { if (audioRef.current) audioRef.current.playbackRate = v; },
-    setVolume: (v: number) => { if (audioRef.current) audioRef.current.volume = v; },
+    setRate: (v: number) => {
+      if (!audioRef.current) return;
+      audioRef.current.preservesPitch = true;
+      audioRef.current.playbackRate = Math.max(0.5, Math.min(2, v));
+    },
+    setVolume: (v: number) => {
+      const safeValue = Math.max(0, Math.min(5, v));
+      volumeValueRef.current = safeValue;
+      const context = contextRef.current;
+      if (context && masterGainRef.current) masterGainRef.current.gain.setTargetAtTime(safeValue, context.currentTime, 0.015);
+    },
     setLoop: (v: boolean) => { if (audioRef.current) audioRef.current.loop = v; },
     events: { onPlay: () => setPlaying(true), onPause: () => setPlaying(false), onEnded: () => setPlaying(false), onDurationChange: () => setDuration(audioRef.current?.duration || duration) }
   };
