@@ -1,0 +1,14 @@
+{
+  "name": "voicescope-3d",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local-first 3D voice analysis workstation",
+  "scripts": {
+    "dev": "node server.mjs",
+    "start": "node server.mjs",
+    "lint": "node scripts/check.mjs",
+    "typecheck": "node scripts/check.mjs",
+    "build": "node scripts/build.mjs"
+  },
+  "engines": { "node": ">=20" }
+}

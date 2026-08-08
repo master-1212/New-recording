@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+  <meta name="theme-color" content="#071012"><meta name="description" content="Private, local-first 3D audio analysis and voice enhancement.">
+  <title>VoiceScope 3D — Local Audio Intelligence</title><link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app-shell">
+  <header>
+    <a class="brand" href="#"><span class="brand-mark"><i></i><i></i><i></i><i></i><i></i></span><span><b>VoiceScope</b><em>3D</em><small>AUDIO INTELLIGENCE</small></span></a>
+    <div class="local-pill"><span></span> Local processing <b>PRIVATE</b></div>
+    <label class="upload-btn">＋ <span>Open audio</span><input id="fileInput" type="file" accept="audio/*,.m4a,.mp3,.wav,.aac"></label>
+  </header>
+
+  <main>
+    <section class="workspace">
+      <div class="section-head"><div><span class="eyebrow">SPECTRAL ANALYSIS</span><h1>Interactive frequency space</h1></div><div class="view-actions"><button class="active" data-view="perspective">3D</button><button data-view="top">TOP</button><button id="resetView" aria-label="Reset 3D view">↺</button></div></div>
+      <div class="stage" id="stage">
+        <canvas id="glCanvas" aria-label="Interactive 3D spectrogram"></canvas>
+        <div class="empty-state" id="emptyState"><div class="orb"><span>⌁</span></div><h2>See every detail in your voice</h2><p>Open an audio recording to reveal its frequency landscape. Your audio never leaves this device.</p><label class="primary-upload">＋ Choose an audio file<input type="file" id="heroInput" accept="audio/*,.m4a,.mp3,.wav,.aac"></label><small>M4A · MP3 · WAV · AAC · browser-supported audio</small></div>
+        <div class="axis axis-z">INTENSITY <b>0 dB</b></div><div class="axis axis-y">FREQUENCY <b>12 kHz</b></div>
+        <div class="live-badge"><i></i><span id="renderStatus">AWAITING SIGNAL</span></div>
+        <div class="gesture-help">Drag to orbit · Pinch/scroll to zoom</div>
+      </div>
+      <div class="overview-panel">
+        <div class="overview-head"><span>RECORDING OVERVIEW</span><div class="legend"><i class="voice"></i> Voice <i class="ambient"></i> Ambient</div></div>
+        <div class="overview" id="overview"><canvas id="overviewCanvas"></canvas><div class="playhead" id="playhead"><span></span></div><div class="overview-empty" id="overviewEmpty">Waveform and voice activity will appear here</div></div>
+      </div>
+    </section>
+
+    <aside class="inspector">
+      <div class="panel-title"><span>VOICE ENHANCE</span><label class="switch"><input id="enhanceToggle" type="checkbox"><i></i></label></div>
+      <p class="muted">Adaptive clarity processing for cleaner, more intelligible speech.</p>
+      <div class="ab"><button id="originalBtn" class="active">A · Original</button><button id="enhancedBtn">B · Enhanced</button></div>
+      <div class="control"><label>Enhancement <output id="strengthOut">65%</output></label><input id="strength" type="range" min="0" max="100" value="65"></div>
+      <div class="control"><label>Clarity / presence <output id="clarityOut">55%</output></label><input id="clarity" type="range" min="0" max="100" value="55"></div>
+      <div class="control"><label>Noise suppression <output id="noiseOut">42%</output></label><input id="noise" type="range" min="0" max="100" value="42"></div>
+      <div class="control"><label>Voice gain <output id="gainOut">+3.0 dB</output></label><input id="voiceGain" type="range" min="-6" max="12" step="0.5" value="3"></div>
+      <hr>
+      <div class="panel-title"><span>LIVE SIGNAL</span><b class="status" id="voiceStatus">NO SIGNAL</b></div>
+      <div class="probability"><div class="ring" id="probRing"><strong id="speechMetric">0</strong><small>%</small></div><div><b>Speech likelihood</b><small id="speechLabel">Waiting for audio</small></div></div>
+      <div class="metrics"><div><small>DOMINANT</small><strong id="freqMetric">—</strong><em>Hz</em></div><div><small>PEAK</small><strong id="peakMetric">—</strong><em>dB</em></div><div><small>RMS</small><strong id="rmsMetric">—</strong><em>dB</em></div><div><small>ENHANCE</small><strong id="enhanceMetric">OFF</strong></div></div>
+      <hr><div class="control compact"><label>Visible window <output id="windowOut">24 sec</output></label><input id="windowRange" type="range" min="8" max="90" value="24"></div><div class="control compact"><label>Depth scale <output id="depthOut">1.4×</output></label><input id="depthRange" type="range" min="5" max="30" value="14"></div>
+      <div class="privacy"><span>◆</span><p><b>Your recording stays private.</b> Audio processing is performed locally in your browser in Version 1. Your recording is not uploaded to a server.</p></div>
+    </aside>
+  </main>
+
+  <footer class="transport">
+    <div class="file-info"><div class="file-icon">♫</div><div><b id="fileName">No recording loaded</b><small id="fileMeta">Open an audio file to begin</small></div></div>
+    <div class="transport-center"><div class="buttons"><button id="backBtn" aria-label="Back 10 seconds">↶<small>10</small></button><button id="playBtn" class="play" aria-label="Play" disabled>▶</button><button id="forwardBtn" aria-label="Forward 10 seconds">↷<small>10</small></button></div><div class="timeline"><time id="currentTime">00:00</time><input id="seekRange" type="range" min="0" max="1" step="0.01" value="0"><time id="duration">00:00</time></div></div>
+    <div class="transport-options"><label>Speed <select id="speed"><option>.75×</option><option selected>1×</option><option>1.25×</option><option>1.5×</option><option>2×</option></select></label><button id="loopBtn" aria-pressed="false">↻ <span>Loop</span></button><label class="volume">◕ <input id="volume" type="range" min="0" max="1" step="0.01" value="0.85"></label><time id="clock">00:00.000</time></div>
+  </footer>
+</div>
+<script type="module" src="app.js"></script>
+</body></html>
