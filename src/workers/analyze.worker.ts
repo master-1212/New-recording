@@ -14,6 +14,7 @@ ctx.onmessage = ({ data }: MessageEvent<Request>) => {
   const rms = new Float32Array(columns);
   const peak = new Float32Array(columns);
   const speech = new Float32Array(columns);
+  const whisper = new Float32Array(columns);
   const dominant = new Float32Array(columns);
   const re = new Float32Array(fftSize);
   const im = new Float32Array(fftSize);
@@ -42,7 +43,7 @@ ctx.onmessage = ({ data }: MessageEvent<Request>) => {
       im[i] = 0;
     }
     fft(re, im);
-    let best = 0, bestBin = 0, voiceEnergy = 0, totalEnergy = 0;
+    let best = 0, bestBin = 0, voiceEnergy = 0, highSpeechEnergy = 0, lowEnergy = 0, totalEnergy = 0;
     for (let b = 0; b < bands; b++) {
       const lowHz = 45 * Math.pow(20000 / 45, b / bands);
       const highHz = 45 * Math.pow(20000 / 45, (b + 1) / bands);
@@ -54,18 +55,32 @@ ctx.onmessage = ({ data }: MessageEvent<Request>) => {
       spectral[c * bands + b] = Math.round(normalized * 255);
       totalEnergy += energy;
       if (lowHz >= 100 && lowHz <= 5000) voiceEnergy += energy;
+      if (lowHz >= 900 && lowHz <= 7000) highSpeechEnergy += energy;
+      if (lowHz < 250) lowEnergy += energy;
       if (energy > best) { best = energy; bestBin = Math.round((lowBin + highBin) / 2); }
     }
     const voiceRatio = voiceEnergy / Math.max(1e-8, totalEnergy);
+    const highSpeechRatio = highSpeechEnergy / Math.max(1e-8, totalEnergy);
+    const lowRatio = lowEnergy / Math.max(1e-8, totalEnergy);
     const zcr = zc / Math.max(1, count);
     const levelScore = Math.min(1, Math.max(0, (20 * Math.log10(level + 1e-7) + 52) / 38));
     speech[c] = Math.min(1, levelScore * 0.52 + voiceRatio * 0.65 + Math.min(zcr * 7, 0.2));
+    const faintLevelScore = Math.min(1, Math.max(0, (20 * Math.log10(level + 1e-7) + 72) / 46));
+    const breathiness = Math.min(1, zcr * 18);
+    // Whisper-like speech has weak periodic energy but sustained upper speech-band detail.
+    whisper[c] = Math.min(1, Math.max(0,
+      faintLevelScore * 0.22 + voiceRatio * 0.32 + highSpeechRatio * 0.58 + breathiness * 0.16 - lowRatio * 0.28 - 0.22,
+    ));
     dominant[c] = bestBin * sampleRate / fftSize;
     if (c % 40 === 0) ctx.postMessage({ type: "progress", progress: c / columns });
   }
 
-  ctx.postMessage({ type: "complete", analysis: { duration, columns, bands, waveform, spectral, rms, peak, speech, dominant } },
-    [waveform.buffer, spectral.buffer, rms.buffer, peak.buffer, speech.buffer, dominant.buffer]);
+  for (let c = 1; c < columns - 1; c++) {
+    whisper[c] = whisper[c - 1] * 0.2 + whisper[c] * 0.6 + whisper[c + 1] * 0.2;
+  }
+
+  ctx.postMessage({ type: "complete", analysis: { duration, columns, bands, waveform, spectral, rms, peak, speech, whisper, dominant } },
+    [waveform.buffer, spectral.buffer, rms.buffer, peak.buffer, speech.buffer, whisper.buffer, dominant.buffer]);
 };
 
 function fft(re: Float32Array, im: Float32Array) {

@@ -3,7 +3,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AnalysisData, EnhanceSettings, FocusSettings, LiveMetrics } from "@/types/audio";
 
-const emptyMetrics: LiveMetrics = { speech: 0, peak: 0, rms: 0, dominant: 0 };
+const emptyMetrics: LiveMetrics = { speech: 0, whisper: 0, peak: 0, rms: 0, dominant: 0 };
+
+function voiceLikelihood(data: AnalysisData, index: number, sensitivity: number) {
+  return Math.min(1, Math.max(data.speech[index], data.whisper[index] * (0.78 + sensitivity * 0.3)));
+}
 
 type RnnoiseModule = {
   loadRnnoise: (options: { url: string; simdUrl: string }) => Promise<ArrayBuffer>;
@@ -27,7 +31,7 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
   const analysisRef = useRef<AnalysisData | null>(null);
   const lastVoiceSkipRef = useRef(-1);
   const volumeValueRef = useRef(0.9);
-  const filtersRef = useRef<{ highpass: BiquadFilterNode; low: BiquadFilterNode; presence: BiquadFilterNode; comp: DynamicsCompressorNode; gain: GainNode } | null>(null);
+  const filtersRef = useRef<{ highpass: BiquadFilterNode; low: BiquadFilterNode; presence: BiquadFilterNode; articulation: BiquadFilterNode; lowpass: BiquadFilterNode; comp: DynamicsCompressorNode; gain: GainNode } | null>(null);
   const urlRef = useRef<string | null>(null);
   const frameRef = useRef(0);
   const [fileName, setFileName] = useState("");
@@ -47,7 +51,7 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
   const updateMetrics = useCallback((time: number, data = analysis) => {
     if (!data || !data.duration) return setMetrics(emptyMetrics);
     const index = Math.min(data.columns - 1, Math.max(0, Math.floor(time / data.duration * data.columns)));
-    setMetrics({ speech: data.speech[index], peak: data.peak[index], rms: data.rms[index], dominant: data.dominant[index] });
+    setMetrics({ speech: data.speech[index], whisper: data.whisper[index], peak: data.peak[index], rms: data.rms[index], dominant: data.dominant[index] });
   }, [analysis]);
 
   useEffect(() => {
@@ -61,21 +65,23 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
         const activeFocus = focusRef.current;
         if (data?.duration && !audio.paused) {
           const index = Math.min(data.columns - 1, Math.floor(time / data.duration * data.columns));
+          const likelihood = voiceLikelihood(data, index, activeFocus.speechSensitivity);
+          const detectionThreshold = 0.68 - activeFocus.speechSensitivity * 0.36;
           const gate = adaptiveGateRef.current;
           const context = contextRef.current;
           if (gate && context) {
             const learnedFloor = activeFocus.noiseFloor;
             const belowNoise = learnedFloor !== null && data.rms[index] < learnedFloor * 1.5;
-            const attenuation = belowNoise && data.speech[index] < 0.48 ? 0.08 : 1;
+            const attenuation = belowNoise && likelihood < detectionThreshold ? (activeFocus.whisperRecovery ? 0.32 : 0.08) : 1;
             gate.gain.setTargetAtTime(attenuation, context.currentTime, attenuation < 1 ? 0.035 : 0.018);
           }
-          if (activeFocus.voiceOnly && data.speech[index] < 0.38 && time - lastVoiceSkipRef.current > 0.25) {
+          if (activeFocus.voiceOnly && likelihood < detectionThreshold - 0.06 && time - lastVoiceSkipRef.current > 0.25) {
             const confirmation = Math.max(2, Math.ceil(data.columns / data.duration * 0.35));
             let quiet = true;
-            for (let i = index; i < Math.min(data.columns, index + confirmation); i++) quiet &&= data.speech[i] < 0.46;
+            for (let i = index; i < Math.min(data.columns, index + confirmation); i++) quiet &&= voiceLikelihood(data, i, activeFocus.speechSensitivity) < detectionThreshold;
             if (quiet) {
               let next = index + confirmation;
-              while (next < data.columns && data.speech[next] < 0.52) next++;
+              while (next < data.columns && voiceLikelihood(data, next, activeFocus.speechSensitivity) < detectionThreshold + 0.04) next++;
               if (next < data.columns) {
                 const nextTime = Math.max(time, next / data.columns * data.duration - 0.08);
                 if (nextTime - time > 0.2) {
@@ -101,13 +107,16 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
     const active = settings.enabled ? 1 : 0;
     wetGainRef.current.gain.setTargetAtTime(active, now, 0.015);
     dryGainRef.current.gain.setTargetAtTime(1 - active, now, 0.015);
-    nodes.highpass.frequency.setTargetAtTime(65 + settings.strength * 45, now, 0.03);
+    const whisperRecovery = focus.whisperRecovery ? 1 : 0;
+    nodes.highpass.frequency.setTargetAtTime(65 + settings.strength * 45 - whisperRecovery * 18, now, 0.03);
     nodes.low.gain.setTargetAtTime(-settings.suppression * 7, now, 0.03);
-    nodes.presence.gain.setTargetAtTime(settings.clarity * 8, now, 0.03);
-    nodes.comp.threshold.setTargetAtTime(-14 - settings.strength * 18, now, 0.03);
+    nodes.presence.gain.setTargetAtTime(settings.clarity * 8 + whisperRecovery * 2, now, 0.03);
+    nodes.articulation.gain.setTargetAtTime(whisperRecovery * (3 + settings.clarity * 5), now, 0.03);
+    nodes.lowpass.frequency.setTargetAtTime(20000 - whisperRecovery * 11800, now, 0.03);
+    nodes.comp.threshold.setTargetAtTime(-14 - settings.strength * 18 - whisperRecovery * 8, now, 0.03);
     nodes.comp.ratio.setTargetAtTime(2 + settings.strength * 5, now, 0.03);
-    nodes.gain.gain.setTargetAtTime(Math.pow(10, ((settings.gain - 0.5) * 14 + settings.strength * 3) / 20), now, 0.03);
-  }, [settings]);
+    nodes.gain.gain.setTargetAtTime(Math.pow(10, ((settings.gain - 0.5) * 14 + settings.strength * 3 + whisperRecovery * 4) / 20), now, 0.03);
+  }, [focus.whisperRecovery, settings]);
 
   const ensureGraph = useCallback(() => {
     if (contextRef.current) return;
@@ -120,6 +129,8 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
     const highpass = context.createBiquadFilter(); highpass.type = "highpass";
     const low = context.createBiquadFilter(); low.type = "lowshelf"; low.frequency.value = 230;
     const presence = context.createBiquadFilter(); presence.type = "peaking"; presence.frequency.value = 2700; presence.Q.value = 0.75;
+    const articulation = context.createBiquadFilter(); articulation.type = "peaking"; articulation.frequency.value = 4600; articulation.Q.value = 0.9;
+    const lowpass = context.createBiquadFilter(); lowpass.type = "lowpass"; lowpass.frequency.value = 20000; lowpass.Q.value = 0.7;
     const comp = context.createDynamicsCompressor(); comp.attack.value = 0.008; comp.release.value = 0.18; comp.knee.value = 12;
     const gain = context.createGain(), adaptiveGate = context.createGain();
     const limiter = context.createDynamicsCompressor();
@@ -127,13 +138,13 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
     source.connect(neuralDry).connect(preprocess);
     neuralWet.connect(preprocess);
     preprocess.connect(dry).connect(master);
-    preprocess.connect(highpass).connect(low).connect(presence).connect(comp).connect(gain).connect(adaptiveGate).connect(wet).connect(master);
+    preprocess.connect(highpass).connect(low).connect(presence).connect(articulation).connect(lowpass).connect(comp).connect(gain).connect(adaptiveGate).connect(wet).connect(master);
     master.connect(limiter).connect(context.destination);
     dry.gain.value = 1; wet.gain.value = 0; neuralDry.gain.value = 1; neuralWet.gain.value = 0;
     master.gain.value = volumeValueRef.current;
     contextRef.current = context; sourceRef.current = source; wetGainRef.current = wet; dryGainRef.current = dry; masterGainRef.current = master;
     neuralDryRef.current = neuralDry; neuralWetRef.current = neuralWet; adaptiveGateRef.current = adaptiveGate;
-    filtersRef.current = { highpass, low, presence, comp, gain };
+    filtersRef.current = { highpass, low, presence, articulation, lowpass, comp, gain };
   }, []);
 
   const initRnnoise = useCallback(async () => {

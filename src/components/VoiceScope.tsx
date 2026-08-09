@@ -1,13 +1,13 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Activity, AudioLines, BrainCircuit, Captions, ChevronRight, Focus, Gauge, Info, LockKeyhole, Pause, Play, Repeat2, RotateCcw, ScanLine, SlidersHorizontal, Sparkles, Upload, Volume2, Waves } from "lucide-react";
+import { Activity, AudioLines, BrainCircuit, Captions, ChevronRight, Ear, Focus, Gauge, Info, Languages, LockKeyhole, Pause, Play, Repeat2, RotateCcw, ScanLine, SlidersHorizontal, Sparkles, Upload, Volume2, Waves } from "lucide-react";
 import { Spectrogram3D } from "./Spectrogram3D";
 import { Overview, WindowWaveform } from "./Overview";
 import { KnobSlider } from "./KnobSlider";
 import { useAudioEngine } from "@/hooks/useAudioEngine";
 import { db, formatTime } from "@/lib/format";
-import type { EnhanceSettings, FocusSettings, TranscriptWord } from "@/types/audio";
+import type { EnhanceSettings, FocusSettings, TranscriptLanguage, TranscriptWord } from "@/types/audio";
 
 export function VoiceScope() {
   const inputRef = useRef<HTMLInputElement>(null);
@@ -17,22 +17,35 @@ export function VoiceScope() {
   const [rate, setRateValue] = useState(1);
   const [volume, setVolumeValue] = useState(0.9);
   const [loop, setLoopValue] = useState(false);
-  const [focus, setFocus] = useState<FocusSettings>({ voiceOnly: false, neuralDenoise: 0, noiseFloor: null });
+  const [focus, setFocus] = useState<FocusSettings>({ voiceOnly: false, neuralDenoise: 0, noiseFloor: null, speechSensitivity: 0.62, whisperRecovery: false });
   const [transcriptionEnabled, setTranscriptionEnabled] = useState(false);
+  const [transcriptLanguage, setTranscriptLanguage] = useState<TranscriptLanguage>("auto");
+  const [transcribedLanguage, setTranscribedLanguage] = useState<TranscriptLanguage | null>(null);
+  const [transcriptBusy, setTranscriptBusy] = useState(false);
   const [transcriptStatus, setTranscriptStatus] = useState("Off");
   const [transcriptProgress, setTranscriptProgress] = useState(0);
   const [transcriptWords, setTranscriptWords] = useState<TranscriptWord[]>([]);
   const [noiseHint, setNoiseHint] = useState("Use a quiet 5-second region");
   const transcriptWorkerRef = useRef<Worker | null>(null);
+  const transcriptionAudioCacheRef = useRef<Float32Array | null>(null);
+  const activeTranscriptLanguageRef = useRef<TranscriptLanguage>("auto");
   const engine = useAudioEngine(settings, focus);
   const setSetting = <K extends keyof EnhanceSettings>(key: K, value: EnhanceSettings[K]) => setSettings((old) => ({ ...old, [key]: value }));
   const ready = Boolean(engine.fileName);
+  const detectionThreshold = 0.68 - focus.speechSensitivity * 0.36;
+  const liveVoiceLikelihood = Math.min(1, Math.max(engine.metrics.speech, engine.metrics.whisper * (0.78 + focus.speechSensitivity * 0.3)));
+  const whisperPresent = engine.metrics.whisper >= detectionThreshold && engine.metrics.whisper > engine.metrics.speech * 0.88;
 
   useEffect(() => () => transcriptWorkerRef.current?.terminate(), []);
 
   const applySpeechFocus = () => {
     setSettings({ enabled: true, strength: 0.84, clarity: 0.82, suppression: 0.76, gain: 0.64 });
-    setFocus((old) => ({ ...old, neuralDenoise: Math.max(old.neuralDenoise, 0.7) }));
+    setFocus((old) => ({ ...old, neuralDenoise: Math.max(old.neuralDenoise, 0.7), whisperRecovery: false }));
+  };
+
+  const applyWhisperRecovery = () => {
+    setSettings({ enabled: true, strength: 0.94, clarity: 0.94, suppression: 0.42, gain: 0.78 });
+    setFocus((old) => ({ ...old, neuralDenoise: Math.min(Math.max(old.neuralDenoise, 0.3), 0.5), speechSensitivity: 0.88, whisperRecovery: true }));
   };
 
   const learnNoiseProfile = () => {
@@ -54,47 +67,82 @@ export function VoiceScope() {
     setNoiseHint(`Learned · ${db(learned)}`);
   };
 
-  const startTranscription = () => {
-    if (!ready) return;
-    if (transcriptWords.length) {
-      setTranscriptionEnabled(true);
-      setTranscriptStatus("Complete · cached for this session");
-      return;
-    }
-    const audio = engine.takeTranscriptionAudio();
-    if (!audio) {
-      setTranscriptionEnabled(true);
-      setTranscriptStatus("Reload the recording to retry transcription.");
-      return;
-    }
-    setTranscriptionEnabled(true);
-    setTranscriptStatus("Preparing local Whisper…");
-    setTranscriptProgress(0.01);
+  const createTranscriptWorker = () => {
     const worker = new Worker(new URL("../workers/transcribe.worker.ts", import.meta.url));
     transcriptWorkerRef.current = worker;
-    worker.onmessage = ({ data }: MessageEvent<{ type: string; status?: string; progress?: number; words?: TranscriptWord[]; error?: string }>) => {
+    worker.onmessage = ({ data }: MessageEvent<{ type: string; status?: string; progress?: number; words?: TranscriptWord[]; error?: string; audio?: Float32Array }>) => {
       if (data.type === "status") {
         setTranscriptStatus(data.status ?? "Working locally…");
         setTranscriptProgress(data.progress ?? 0);
       }
       if (data.type === "complete") {
+        transcriptionAudioCacheRef.current = data.audio ?? null;
         setTranscriptWords(data.words ?? []);
+        setTranscribedLanguage(activeTranscriptLanguageRef.current);
         setTranscriptStatus(data.words?.length ? `Complete · ${data.words.length} timed words` : "Complete · no clear speech detected");
         setTranscriptProgress(1);
+        setTranscriptBusy(false);
         worker.terminate();
+        transcriptWorkerRef.current = null;
       }
       if (data.type === "error") {
+        transcriptionAudioCacheRef.current = data.audio ?? null;
         setTranscriptStatus(`Unavailable: ${data.error ?? "model could not load"}`);
         setTranscriptProgress(0);
+        setTranscriptBusy(false);
         worker.terminate();
+        transcriptWorkerRef.current = null;
       }
     };
     worker.onerror = () => {
-      setTranscriptStatus("Unavailable: this browser blocked the local model worker.");
+      setTranscriptStatus("Unavailable: this browser blocked the local model worker. Reload the recording to retry.");
       setTranscriptProgress(0);
+      setTranscriptBusy(false);
       worker.terminate();
+      transcriptWorkerRef.current = null;
     };
-    worker.postMessage({ audio }, [audio.buffer]);
+    return worker;
+  };
+
+  const startTranscription = (language = transcriptLanguage) => {
+    if (!ready) return;
+    if (transcriptBusy) return;
+    if (transcribedLanguage === language) {
+      setTranscriptionEnabled(true);
+      setTranscriptStatus("Complete · cached for this session");
+      return;
+    }
+    setTranscriptionEnabled(true);
+    setTranscriptBusy(true);
+    setTranscriptWords([]);
+    setTranscribedLanguage(null);
+    setTranscriptStatus("Preparing local Whisper…");
+    setTranscriptProgress(0.01);
+    activeTranscriptLanguageRef.current = language;
+    const audio = transcriptionAudioCacheRef.current ?? engine.takeTranscriptionAudio();
+    if (!audio) {
+      setTranscriptStatus("Reload the recording to retry transcription.");
+      setTranscriptBusy(false);
+      return;
+    }
+    transcriptionAudioCacheRef.current = null;
+    const worker = createTranscriptWorker();
+    worker.postMessage({ audio, language }, [audio.buffer]);
+  };
+
+  const loadRecording = (file: File) => {
+    transcriptWorkerRef.current?.terminate();
+    transcriptWorkerRef.current = null;
+    transcriptionAudioCacheRef.current = null;
+    setTranscriptionEnabled(false);
+    setTranscriptBusy(false);
+    setTranscriptStatus("Off");
+    setTranscriptProgress(0);
+    setTranscriptWords([]);
+    setTranscribedLanguage(null);
+    setFocus((old) => ({ ...old, noiseFloor: null }));
+    setNoiseHint("Use a quiet 5-second region");
+    void engine.loadFile(file);
   };
 
   return <main>
@@ -102,7 +150,7 @@ export function VoiceScope() {
     <header className="topbar">
       <div className="brand"><div className="brand-mark"><AudioLines/></div><div><h1>VoiceScope <em>3D</em></h1><p>LOCAL AUDIO INTELLIGENCE</p></div></div>
       <div className="privacy"><LockKeyhole/><span><b>Private session</b>Processing stays on this device</span></div>
-      <input ref={inputRef} type="file" accept="audio/*,.m4a,.aac,.mp3,.wav" hidden onChange={(e) => e.target.files?.[0] && engine.loadFile(e.target.files[0])}/>
+      <input ref={inputRef} type="file" accept="audio/*,.m4a,.aac,.mp3,.wav" hidden onChange={(e) => e.target.files?.[0] && loadRecording(e.target.files[0])}/>
       <button className="upload-button" onClick={() => inputRef.current?.click()}><Upload/> {ready ? "Replace audio" : "Load audio"}</button>
     </header>
 
@@ -127,7 +175,7 @@ export function VoiceScope() {
         <div className="overview-wrap">
           <div className="overview-labels"><span>FULL RECORDING · HEATMAP + WAVEFORM</span><span>{formatTime(engine.duration)}</span></div>
           <Overview analysis={engine.analysis} currentTime={engine.currentTime} duration={engine.duration} onSeek={engine.seek}/>
-          <div className="vad-row"><span>VOICE ACTIVITY</span><div className="vad-track">{engine.analysis && Array.from({length: 80}, (_, i) => { const idx = Math.floor(i / 80 * engine.analysis!.columns); return <i key={i} style={{ opacity: engine.analysis!.speech[idx] > .5 ? .3 + engine.analysis!.speech[idx] * .7 : .04 }}/>; })}</div></div>
+          <div className="vad-row"><span>VOICE + WHISPER ACTIVITY</span><div className="vad-track">{engine.analysis && Array.from({length: 80}, (_, i) => { const idx = Math.floor(i / 80 * engine.analysis!.columns); const likelihood = Math.max(engine.analysis!.speech[idx], engine.analysis!.whisper[idx] * .9); return <i key={i} style={{ opacity: likelihood >= detectionThreshold ? .3 + likelihood * .7 : .04 }}/>; })}</div></div>
         </div>
 
         <section className="transport">
@@ -150,16 +198,19 @@ export function VoiceScope() {
           <KnobSlider label="Voice gain" value={settings.gain} onChange={(v) => setSetting("gain", v)}/>
           <div className="chain"><span>HPF</span><ChevronRight/><span>EQ</span><ChevronRight/><span>COMP</span><ChevronRight/><span>LIMIT</span></div>
           <button className="focus-preset" onClick={applySpeechFocus}><Focus/><span><b>Speech Focus preset</b><small>Strong clarity + RNNoise</small></span></button>
+          <button className={focus.whisperRecovery ? "focus-preset whisper-preset active" : "focus-preset whisper-preset"} onClick={applyWhisperRecovery}><Ear/><span><b>Whisper Recovery preset</b><small>Preserves and lifts faint breathy speech</small></span></button>
           <div className="focus-tools">
             <button onClick={learnNoiseProfile} disabled={!engine.analysis}><ScanLine/><span><b>Learn noise profile</b><small>{noiseHint}</small></span></button>
             <label className="feature-toggle"><span><b>Voice-only playback</b><small>Skips detected non-speech</small></span><button role="switch" aria-checked={focus.voiceOnly} className={focus.voiceOnly ? "toggle on" : "toggle"} onClick={() => setFocus((old) => ({ ...old, voiceOnly: !old.voiceOnly }))} disabled={!ready}><i/></button></label>
           </div>
           <label className="neural-slider"><span><BrainCircuit/><b>Local neural denoising</b><output>{Math.round(focus.neuralDenoise * 100)}%</output></span><input type="range" min="0" max="1" step=".05" value={focus.neuralDenoise} onChange={(e) => setFocus((old) => ({ ...old, neuralDenoise: Number(e.target.value) }))}/><small>{engine.neuralStatus === "loading" ? "Loading RNNoise locally…" : engine.neuralStatus === "error" ? `RNNoise unavailable: ${engine.neuralDetail}` : engine.neuralStatus === "ready" ? "RNNoise active · audio stays on device" : focus.neuralDenoise ? "Ready to load when playback starts" : "Off"}</small></label>
+          <label className="neural-slider sensitivity-slider"><span><Activity/><b>Speech / whisper sensitivity</b><output>{Math.round(focus.speechSensitivity * 100)}%</output></span><input type="range" min="0" max="1" step=".05" value={focus.speechSensitivity} onChange={(e) => setFocus((old) => ({ ...old, speechSensitivity: Number(e.target.value) }))}/><small>Higher values preserve fainter candidates but may include more background sound.</small></label>
         </div>
 
         <div className="inspector-title transcript-title"><Captions/><span>LOCAL TRANSCRIPT</span></div>
         <div className="transcript-card">
-          <div className="feature-toggle"><span><b>Whisper transcription</b><small>English · word timestamps</small></span><button role="switch" aria-checked={transcriptionEnabled} className={transcriptionEnabled ? "toggle on" : "toggle"} onClick={() => transcriptionEnabled ? setTranscriptionEnabled(false) : startTranscription()} disabled={!ready}><i/></button></div>
+          <label className="transcript-language"><Languages/><span><b>Spoken language</b><small>Choose a language for muffled audio</small></span><select value={transcriptLanguage} disabled={transcriptBusy} onChange={(event) => { const language = event.target.value as TranscriptLanguage; setTranscriptLanguage(language); if (transcriptionEnabled) startTranscription(language); }}><option value="auto">Auto detect</option><option value="en">English</option><option value="hi">हिन्दी · Hindi</option><option value="mr">मराठी · Marathi</option></select></label>
+          <div className="feature-toggle"><span><b>Whisper transcription</b><small>English · Hindi · Marathi · word timestamps</small></span><button role="switch" aria-checked={transcriptionEnabled} className={transcriptionEnabled ? "toggle on" : "toggle"} onClick={() => transcriptionEnabled ? setTranscriptionEnabled(false) : startTranscription()} disabled={!ready}><i/></button></div>
           {transcriptionEnabled && <>
             <div className="transcript-progress"><i style={{ width: `${transcriptProgress * 100}%` }}/></div>
             <p className="transcript-status">{transcriptStatus}</p>
@@ -169,8 +220,9 @@ export function VoiceScope() {
         </div>
 
         <div className="inspector-title metrics-title"><Gauge/><span>LIVE SIGNAL</span></div>
-        <div className="voice-status"><div className={engine.metrics.speech > .5 ? "pulse speaking" : "pulse"}><Activity/></div><div><span>CURRENT DETECTION</span><b>{engine.metrics.speech > .5 ? "VOICE PRESENT" : ready ? "AMBIENT / SILENCE" : "NO SIGNAL"}</b></div></div>
+        <div className="voice-status"><div className={liveVoiceLikelihood >= detectionThreshold ? "pulse speaking" : "pulse"}><Activity/></div><div><span>CURRENT DETECTION</span><b>{whisperPresent ? "WHISPER-LIKE SPEECH" : liveVoiceLikelihood >= detectionThreshold ? "VOICE PRESENT" : ready ? "AMBIENT / SILENCE" : "NO SIGNAL"}</b></div></div>
         <div className="probability"><span><b>Speech likelihood</b><strong>{Math.round(engine.metrics.speech * 100)}%</strong></span><div><i style={{width: `${engine.metrics.speech * 100}%`}}/></div></div>
+        <div className="probability whisper-probability"><span><b>Whisper likelihood</b><strong>{Math.round(engine.metrics.whisper * 100)}%</strong></span><div><i style={{width: `${engine.metrics.whisper * 100}%`}}/></div></div>
         <div className="metric-grid">
           <div><span>DOMINANT</span><b>{engine.metrics.dominant >= 1000 ? `${(engine.metrics.dominant / 1000).toFixed(2)} kHz` : `${Math.round(engine.metrics.dominant)} Hz`}</b></div>
           <div><span>PEAK LEVEL</span><b>{db(engine.metrics.peak)}</b></div>

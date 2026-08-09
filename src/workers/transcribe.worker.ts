@@ -1,6 +1,6 @@
 /// <reference lib="webworker" />
 
-import type { TranscriptWord } from "@/types/audio";
+import type { TranscriptLanguage, TranscriptWord } from "@/types/audio";
 
 type PipelineResult = {
   text?: string;
@@ -19,8 +19,17 @@ type TransformersModule = {
 };
 
 let transcriber: Transcriber | null = null;
+let cachedAudio: Float32Array | null = null;
+let transcribing = false;
 
-self.onmessage = async ({ data }: MessageEvent<{ audio: Float32Array }>) => {
+self.onmessage = async ({ data }: MessageEvent<{ audio?: Float32Array; language: TranscriptLanguage }>) => {
+  if (data.audio) cachedAudio = data.audio;
+  if (!cachedAudio) {
+    self.postMessage({ type: "error", error: "Reload the recording before starting transcription." });
+    return;
+  }
+  if (transcribing) return;
+  transcribing = true;
   try {
     self.postMessage({ type: "status", status: "Loading local Whisper model…", progress: 0.03 });
     if (!transcriber) {
@@ -32,7 +41,7 @@ self.onmessage = async ({ data }: MessageEvent<{ audio: Float32Array }>) => {
       transformers.env.useBrowserCache = true;
       transcriber = await transformers.pipeline(
         "automatic-speech-recognition",
-        "onnx-community/whisper-tiny.en_timestamped",
+        "onnx-community/whisper-tiny_timestamped",
         {
           dtype: "q8",
           device: "wasm",
@@ -50,22 +59,37 @@ self.onmessage = async ({ data }: MessageEvent<{ audio: Float32Array }>) => {
     }
 
     self.postMessage({ type: "status", status: "Transcribing on this device…", progress: 0.7 });
-    const result = await transcriber(data.audio, {
+    const languageNames: Record<Exclude<TranscriptLanguage, "auto">, string> = {
+      en: "english",
+      hi: "hindi",
+      mr: "marathi",
+    };
+    const languageOptions = data.language === "auto" ? {} : { language: languageNames[data.language] };
+    const result = await transcriber(cachedAudio, {
       return_timestamps: "word",
-      chunk_length_s: 30,
+      chunk_length_s: 29,
       stride_length_s: 5,
+      task: "transcribe",
+      ...languageOptions,
     });
     const words: TranscriptWord[] = (result.chunks ?? []).flatMap((chunk) => {
       const [start, rawEnd] = chunk.timestamp;
       const end = rawEnd ?? start;
       return Number.isFinite(start) ? [{ text: chunk.text, start, end }] : [];
     });
-    self.postMessage({ type: "complete", text: result.text ?? "", words });
+    const audio = cachedAudio;
+    cachedAudio = null;
+    self.postMessage({ type: "complete", text: result.text ?? "", words, audio }, audio ? [audio.buffer] : []);
   } catch (cause) {
+    const audio = cachedAudio;
+    cachedAudio = null;
     self.postMessage({
       type: "error",
       error: cause instanceof Error ? cause.message : "Local transcription could not start.",
-    });
+      audio,
+    }, audio ? [audio.buffer] : []);
+  } finally {
+    transcribing = false;
   }
 };
 

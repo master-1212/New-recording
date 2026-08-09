@@ -5,13 +5,14 @@ import { Grid, OrbitControls, PerspectiveCamera } from "@react-three/drei";
 import { useMemo } from "react";
 import * as THREE from "three";
 import type { AnalysisData } from "@/types/audio";
+import { getVisibleTimeRange } from "@/lib/timeWindow";
 
 function Surface({ analysis, currentTime, windowSeconds, depth }: { analysis: AnalysisData; currentTime: number; windowSeconds: number; depth: number }) {
+  const range = getVisibleTimeRange(currentTime, analysis.duration, windowSeconds);
+  const first = Math.max(0, Math.floor((range.start / analysis.duration) * analysis.columns));
+  const last = Math.min(analysis.columns - 1, Math.ceil((range.end / analysis.duration) * analysis.columns));
   const geometry = useMemo(() => {
     const frequencySteps = 36, timeSteps = 96;
-    const half = windowSeconds / 2;
-    const first = Math.max(0, Math.floor(((currentTime - half) / analysis.duration) * analysis.columns));
-    const last = Math.min(analysis.columns - 1, Math.ceil(((currentTime + half) / analysis.duration) * analysis.columns));
     const vertices = new Float32Array(timeSteps * frequencySteps * 3);
     const colors = new Float32Array(timeSteps * frequencySteps * 3);
     const indices: number[] = [];
@@ -38,19 +39,21 @@ function Surface({ analysis, currentTime, windowSeconds, depth }: { analysis: An
     result.setAttribute("color", new THREE.BufferAttribute(colors, 3));
     result.setIndex(indices); result.computeVertexNormals();
     return result;
-  }, [analysis, currentTime, windowSeconds, depth]);
+  }, [analysis, depth, first, last]);
   return <mesh geometry={geometry}><meshStandardMaterial vertexColors side={THREE.DoubleSide} roughness={0.7} metalness={0.12} /></mesh>;
 }
 
 export function Spectrogram3D(props: { analysis: AnalysisData | null; currentTime: number; windowSeconds: number; depth: number }) {
+  const range = props.analysis ? getVisibleTimeRange(props.currentTime, props.analysis.duration, props.windowSeconds) : null;
+  const cursorX = range ? (range.cursorRatio - 0.5) * 12 : 0;
   return <div className="three-stage" aria-label="Interactive 3D spectrogram">
     {!props.analysis && <div className="empty-visual"><div className="empty-rings"/><span>SPECTRAL FIELD STANDBY</span><p>Load a recording to construct the frequency surface</p></div>}
-    {props.analysis && <Canvas dpr={[1, 1.5]} gl={{ antialias: true, powerPreference: "high-performance" }}>
+    {props.analysis && <Canvas dpr={[1, 1.5]} gl={{ antialias: true, powerPreference: "high-performance" }} fallback={<div className="webgl-fallback"><span>3D VIEW UNAVAILABLE</span><p>The synchronized waveform and heatmap remain active.</p></div>}>
       <color attach="background" args={["#07100f"]}/><fog attach="fog" args={["#07100f", 8, 22]}/>
       <PerspectiveCamera makeDefault position={[8.4, 6.5, 9.4]} fov={45}/>
       <ambientLight intensity={0.65}/><directionalLight position={[2, 8, 4]} intensity={2.2} color="#85ffe4"/>
       <Surface {...props} analysis={props.analysis}/>
-      <mesh position={[0, 1.1, 0]}><boxGeometry args={[0.035, 5, 7.1]}/><meshBasicMaterial color="#f5bb45" transparent opacity={0.9}/></mesh>
+      <mesh position={[cursorX, 1.1, 0]}><boxGeometry args={[0.035, 5, 7.1]}/><meshBasicMaterial color="#f5bb45" transparent opacity={0.9}/></mesh>
       <Grid args={[14, 10]} position={[0, -1.3, 0]} cellColor="#173f39" sectionColor="#2c776b" fadeDistance={18} infiniteGrid/>
       <OrbitControls enableDamping dampingFactor={0.08} minDistance={5} maxDistance={22} maxPolarAngle={Math.PI / 2.08}/>
     </Canvas>}

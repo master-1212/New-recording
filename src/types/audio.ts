@@ -7,6 +7,7 @@ export type AnalysisData = {
   rms: Float32Array;
   peak: Float32Array;
   speech: Float32Array;
+  whisper: Float32Array;
   dominant: Float32Array;
 };
 
@@ -22,7 +23,11 @@ export type FocusSettings = {
   voiceOnly: boolean;
   neuralDenoise: number;
   noiseFloor: number | null;
+  speechSensitivity: number;
+  whisperRecovery: boolean;
 };
+
+export type TranscriptLanguage = "auto" | "en" | "hi" | "mr";
 
 export type TranscriptWord = {
   text: string;
@@ -32,6 +37,7 @@ export type TranscriptWord = {
 
 export type LiveMetrics = {
   speech: number;
+  whisper: number;
   peak: number;
   rms: number;
   dominant: number;
