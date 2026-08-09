@@ -18,6 +18,8 @@ ctx.onmessage = ({ data }: MessageEvent<Request>) => {
   const pitch = new Float32Array(columns);
   const profile = new Float32Array(columns);
   const profileConfidence = new Float32Array(columns);
+  const noiseFrames = Math.min(36000, Math.max(1, Math.ceil(duration * 10)));
+  const noiseRms = new Float32Array(noiseFrames);
   const rawPitch = new Float32Array(columns);
   const periodicity = new Float32Array(columns);
   const dominant = new Float32Array(columns);
@@ -25,6 +27,19 @@ ctx.onmessage = ({ data }: MessageEvent<Request>) => {
   const im = new Float32Array(fftSize);
   const pitchFrame = new Float32Array(480);
   const pitchScores = new Float32Array(110);
+
+  for (let frame = 0; frame < noiseFrames; frame++) {
+    const start = Math.floor(frame / noiseFrames * samples.length);
+    const end = Math.max(start + 1, Math.floor((frame + 1) / noiseFrames * samples.length));
+    const stride = Math.max(1, Math.floor((end - start) / 256));
+    let sumSq = 0, count = 0;
+    for (let index = start; index < end; index += stride) {
+      const sample = samples[index] || 0;
+      sumSq += sample * sample;
+      count++;
+    }
+    noiseRms[frame] = Math.sqrt(sumSq / Math.max(1, count));
+  }
 
   for (let c = 0; c < columns; c++) {
     const start = Math.floor((c / columns) * samples.length);
@@ -113,8 +128,8 @@ ctx.onmessage = ({ data }: MessageEvent<Request>) => {
     profileConfidence[c] = Math.min(1, separation * clarity * speech[c] * whisperPenalty);
   }
 
-  ctx.postMessage({ type: "complete", analysis: { duration, columns, bands, waveform, spectral, rms, peak, speech, whisper, pitch, profile, profileConfidence, dominant } },
-    [waveform.buffer, spectral.buffer, rms.buffer, peak.buffer, speech.buffer, whisper.buffer, pitch.buffer, profile.buffer, profileConfidence.buffer, dominant.buffer]);
+  ctx.postMessage({ type: "complete", analysis: { duration, columns, bands, waveform, spectral, rms, peak, speech, whisper, pitch, profile, profileConfidence, noiseFrames, noiseRms, dominant } },
+    [waveform.buffer, spectral.buffer, rms.buffer, peak.buffer, speech.buffer, whisper.buffer, pitch.buffer, profile.buffer, profileConfidence.buffer, noiseRms.buffer, dominant.buffer]);
 };
 
 function estimatePitch(samples: Float32Array, center: number, sampleRate: number, frame: Float32Array, scores: Float32Array) {

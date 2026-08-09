@@ -11,6 +11,8 @@ export type AnalysisData = {
   pitch: Float32Array;
   profile: Float32Array;
   profileConfidence: Float32Array;
+  noiseFrames: number;
+  noiseRms: Float32Array;
   dominant: Float32Array;
 };
 
@@ -26,6 +28,7 @@ export type FocusSettings = {
   voiceOnly: boolean;
   neuralDenoise: number;
   noiseFloor: number | null;
+  noiseProfileEnabled: boolean;
   speechSensitivity: number;
   whisperRecovery: boolean;
 };

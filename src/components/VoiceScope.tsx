@@ -8,6 +8,7 @@ import { KnobSlider } from "./KnobSlider";
 import { VoiceProfilePanel } from "./VoiceProfilePanel";
 import { useAudioEngine } from "@/hooks/useAudioEngine";
 import { db, formatTime } from "@/lib/format";
+import { getVisibleTimeRange } from "@/lib/timeWindow";
 import type { EnhanceSettings, FocusSettings, TranscriptLanguage, TranscriptWord } from "@/types/audio";
 
 export function VoiceScope() {
@@ -18,7 +19,7 @@ export function VoiceScope() {
   const [rate, setRateValue] = useState(1);
   const [volume, setVolumeValue] = useState(0.9);
   const [loop, setLoopValue] = useState(false);
-  const [focus, setFocus] = useState<FocusSettings>({ voiceOnly: false, neuralDenoise: 0, noiseFloor: null, speechSensitivity: 0.62, whisperRecovery: false });
+  const [focus, setFocus] = useState<FocusSettings>({ voiceOnly: false, neuralDenoise: 0, noiseFloor: null, noiseProfileEnabled: false, speechSensitivity: 0.62, whisperRecovery: false });
   const [transcriptionEnabled, setTranscriptionEnabled] = useState(false);
   const [transcriptLanguage, setTranscriptLanguage] = useState<TranscriptLanguage>("auto");
   const [transcribedLanguage, setTranscribedLanguage] = useState<TranscriptLanguage | null>(null);
@@ -27,6 +28,7 @@ export function VoiceScope() {
   const [transcriptProgress, setTranscriptProgress] = useState(0);
   const [transcriptWords, setTranscriptWords] = useState<TranscriptWord[]>([]);
   const [noiseHint, setNoiseHint] = useState("Use a quiet 5-second region");
+  const [noiseConfidence, setNoiseConfidence] = useState(0);
   const transcriptWorkerRef = useRef<Worker | null>(null);
   const transcriptionAudioCacheRef = useRef<Float32Array | null>(null);
   const activeTranscriptLanguageRef = useRef<TranscriptLanguage>("auto");
@@ -51,21 +53,47 @@ export function VoiceScope() {
 
   const learnNoiseProfile = () => {
     const data = engine.analysis;
-    if (!data?.duration) return;
-    const center = Math.floor(engine.currentTime / data.duration * data.columns);
-    const radius = Math.max(3, Math.floor(data.columns / data.duration * 2.5));
+    if (!data?.duration || !data.noiseFrames) return;
+    const range = getVisibleTimeRange(engine.currentTime, data.duration, Math.min(5, data.duration));
+    const start = Math.max(0, Math.floor(range.start / data.duration * data.noiseFrames));
+    const end = Math.min(data.noiseFrames, Math.ceil(range.end / data.duration * data.noiseFrames));
     const candidates: number[] = [];
-    for (let i = Math.max(0, center - radius); i <= Math.min(data.columns - 1, center + radius); i++) {
-      if (data.speech[i] < 0.4 && data.rms[i] > 0) candidates.push(data.rms[i]);
+    for (let frame = start; frame < end; frame++) {
+      const time = (frame + 0.5) / data.noiseFrames * data.duration;
+      const column = Math.min(data.columns - 1, Math.floor(time / data.duration * data.columns));
+      const voiced = data.pitch[column] > 0 && data.speech[column] > 0.45;
+      const strongWhisper = data.whisper[column] >= 0.62;
+      if (!voiced && !strongWhisper && data.noiseRms[frame] > 0) candidates.push(data.noiseRms[frame]);
     }
-    if (!candidates.length) {
-      setNoiseHint("Move to a quieter moment and retry");
+    const expected = Math.max(1, end - start);
+    if (candidates.length < Math.max(4, Math.ceil(expected * 0.35))) {
+      setNoiseHint("Rejected · speech/whisper dominates this region");
+      setNoiseConfidence(0);
       return;
     }
     candidates.sort((a, b) => a - b);
-    const learned = candidates[Math.floor(candidates.length * 0.7)];
-    setFocus((old) => ({ ...old, noiseFloor: learned }));
-    setNoiseHint(`Learned · ${db(learned)}`);
+    const learned = candidates[Math.floor(candidates.length * 0.65)];
+    const low = candidates[Math.floor(candidates.length * 0.2)];
+    const high = candidates[Math.floor(candidates.length * 0.85)];
+    const coverage = Math.min(1, candidates.length / Math.max(1, expected * 0.7));
+    const spread = (high - low) / Math.max(learned, 1e-6);
+    const confidence = Math.round(100 * coverage * (1 - Math.min(0.55, spread * 0.28)));
+    setFocus((old) => ({ ...old, noiseFloor: learned, noiseProfileEnabled: true }));
+    setSetting("enabled", true);
+    setNoiseConfidence(confidence);
+    setNoiseHint(`Active · ${db(learned)} · ${confidence}% confidence`);
+  };
+
+  const setNoiseProfileEnabled = (enabled: boolean) => {
+    if (enabled) setSetting("enabled", true);
+    setFocus((old) => ({ ...old, noiseProfileEnabled: enabled && old.noiseFloor !== null }));
+    if (focus.noiseFloor !== null) setNoiseHint(`${enabled ? "Active" : "Learned · paused"} · ${db(focus.noiseFloor)} · ${noiseConfidence}% confidence`);
+  };
+
+  const resetNoiseProfile = () => {
+    setFocus((old) => ({ ...old, noiseFloor: null, noiseProfileEnabled: false }));
+    setNoiseConfidence(0);
+    setNoiseHint("Use a quiet 5-second region");
   };
 
   const createTranscriptWorker = () => {
@@ -141,7 +169,8 @@ export function VoiceScope() {
     setTranscriptProgress(0);
     setTranscriptWords([]);
     setTranscribedLanguage(null);
-    setFocus((old) => ({ ...old, noiseFloor: null }));
+    setFocus((old) => ({ ...old, noiseFloor: null, noiseProfileEnabled: false }));
+    setNoiseConfidence(0);
     setNoiseHint("Use a quiet 5-second region");
     void engine.loadFile(file);
   };
@@ -186,6 +215,7 @@ export function VoiceScope() {
           <button className={loop ? "icon-button active" : "icon-button"} onClick={() => { setLoopValue(!loop); engine.setLoop(!loop); }} aria-label="Loop"><Repeat2/></button>
           <label className={volume > 1 ? "volume boosted" : "volume"} title="Master gain is protected by a limiter"><Volume2/><span>{Math.round(volume * 100)}%</span><input aria-label="Master volume" type="range" min="0" max="5" step=".05" value={volume} onChange={(e) => { const v = Number(e.target.value); setVolumeValue(v); engine.setVolume(v); }}/></label>
         </section>
+        <VoiceProfilePanel analysis={engine.analysis} currentTime={engine.currentTime} windowSeconds={windowSeconds} onSeek={engine.seek}/>
       </section>
 
       <aside className="inspector">
@@ -202,6 +232,8 @@ export function VoiceScope() {
           <button className={focus.whisperRecovery ? "focus-preset whisper-preset active" : "focus-preset whisper-preset"} onClick={applyWhisperRecovery}><Ear/><span><b>Whisper Recovery preset</b><small>Preserves and lifts faint breathy speech</small></span></button>
           <div className="focus-tools">
             <button onClick={learnNoiseProfile} disabled={!engine.analysis}><ScanLine/><span><b>Learn noise profile</b><small>{noiseHint}</small></span></button>
+            <label className="feature-toggle"><span><b>Use learned profile</b><small>{focus.noiseFloor === null ? "Learn a quiet region first" : !focus.noiseProfileEnabled ? `Ready · ${noiseConfidence}% confidence` : !settings.enabled ? "Paused in Original/A" : engine.noiseReductionDb > 0.1 ? `Reducing ${engine.noiseReductionDb.toFixed(1)} dB now` : `Active · monitoring · ${noiseConfidence}% confidence`}</small></span><button role="switch" aria-label="Use learned noise profile" aria-checked={focus.noiseProfileEnabled} className={focus.noiseProfileEnabled ? "toggle on" : "toggle"} onClick={() => setNoiseProfileEnabled(!focus.noiseProfileEnabled)} disabled={focus.noiseFloor === null}><i/></button></label>
+            {focus.noiseFloor !== null ? <button className="noise-reset" onClick={resetNoiseProfile}><RotateCcw/><span><b>Reset noise profile</b><small>Forget the learned threshold</small></span></button> : null}
             <label className="feature-toggle"><span><b>Voice-only playback</b><small>Skips detected non-speech</small></span><button role="switch" aria-checked={focus.voiceOnly} className={focus.voiceOnly ? "toggle on" : "toggle"} onClick={() => setFocus((old) => ({ ...old, voiceOnly: !old.voiceOnly }))} disabled={!ready}><i/></button></label>
           </div>
           <label className="neural-slider"><span><BrainCircuit/><b>Local neural denoising</b><output>{Math.round(focus.neuralDenoise * 100)}%</output></span><input type="range" min="0" max="1" step=".05" value={focus.neuralDenoise} onChange={(e) => setFocus((old) => ({ ...old, neuralDenoise: Number(e.target.value) }))}/><small>{engine.neuralStatus === "loading" ? "Loading RNNoise locally…" : engine.neuralStatus === "error" ? `RNNoise unavailable: ${engine.neuralDetail}` : engine.neuralStatus === "ready" ? "RNNoise active · audio stays on device" : focus.neuralDenoise ? "Ready to load when playback starts" : "Off"}</small></label>
@@ -219,8 +251,6 @@ export function VoiceScope() {
             <p className="diarization-note">Speaker labels are withheld: this build does not yet have a reliable local speaker-embedding model, so it will not guess who spoke.</p>
           </>}
         </div>
-
-        <VoiceProfilePanel analysis={engine.analysis} currentTime={engine.currentTime} onSeek={engine.seek}/>
 
         <div className="inspector-title metrics-title"><Gauge/><span>LIVE SIGNAL</span></div>
         <div className="voice-status"><div className={liveVoiceLikelihood >= detectionThreshold ? "pulse speaking" : "pulse"}><Activity/></div><div><span>CURRENT DETECTION</span><b>{whisperPresent ? "WHISPER-LIKE SPEECH" : liveVoiceLikelihood >= detectionThreshold ? "VOICE PRESENT" : ready ? "AMBIENT / SILENCE" : "NO SIGNAL"}</b></div></div>

@@ -7,20 +7,20 @@ Transport playback supports 0.5×–2× speed with pitch preservation, ±10-seco
 ## Architecture
 
 - `src/hooks/useAudioEngine.ts` owns decoding, transport synchronization, the Web Audio graph, and DSP state.
-- `src/workers/analyze.worker.ts` creates bounded-resolution waveform, log-frequency spectral, level, dominant-frequency, voice-activity, whisper-likelihood, and acoustic voice-profile data off the UI thread.
+- `src/workers/analyze.worker.ts` creates bounded-resolution waveform, log-frequency spectral, level, dominant-frequency, voice-activity, whisper-likelihood, acoustic voice-profile data, and a capped high-resolution noise envelope off the UI thread.
 - `src/workers/transcribe.worker.ts` lazily loads Whisper in a dedicated worker and returns clickable word-level timestamps without uploading the recording.
 - `src/components/Spectrogram3D.tsx` renders only a playback-centered spectral window on the GPU. Orbit controls provide mouse/touch rotation, pinch zoom, and pan.
 - `src/components/Overview.tsx` draws both a zoomed waveform synchronized to the 3D visible window and the full-recording heatmap, waveform, VAD, and seek cursor. Both views use the same clamped time-range function, including near the beginning and end of a recording.
 
 ## Spectrogram and performance
 
-Audio is decoded once and mixed to mono for analysis. The worker caps the overview at 1,800 time columns and 72 logarithmic frequency bands, transferring typed-array buffers without copying. The 3D surface samples only 96 × 36 vertices around the playhead. React does not hold per-frame FFT data, and the complete spectrogram is never recomputed during playback. This tiered resolution keeps memory bounded for 30–60 minute recordings.
+Audio is decoded once and mixed to mono for analysis. The worker caps the overview at 1,800 time columns and 72 logarithmic frequency bands, transferring typed-array buffers without copying. A separate 10 Hz noise envelope is capped at 36,000 frames (about 144 KB) so five-second noise learning remains precise on long recordings. The 3D surface samples only 96 × 36 vertices around the playhead. React does not hold per-frame FFT data, and the complete spectrogram is never recomputed during playback. This tiered resolution keeps memory bounded for 30–60 minute recordings.
 
 ## Voice Enhance DSP
 
 The enhanced branch uses an adjustable high-pass filter, low-shelf attenuation, 2.7 kHz presence EQ, soft-knee compressor, makeup gain, an adaptive learned-noise gate, and the browser output limiter. A parallel dry branch makes the A/B transition immediate and click-free. The shared master stage supports 0–500% gain and feeds a fast limiter to reduce clipping at high boost.
 
-Speech Focus applies a strong intelligibility preset and enables a 70% RNNoise blend. RNNoise runs as a local WASM `AudioWorklet`; the slider crossfades it with the unprocessed signal. Learn Noise Profile samples a quiet five-second region around the playhead and uses that level to attenuate low-likelihood background sound. Voice-only playback uses the VAD timeline to skip sustained non-speech sections.
+Speech Focus applies a strong intelligibility preset and enables a 70% RNNoise blend. RNNoise runs as a local WASM `AudioWorklet`; the slider crossfades it with the unprocessed signal. Learn Noise Profile samples an exact five-second region from the high-resolution envelope, rejects speech/whisper candidates, calculates a confidence score, and automatically enables the Enhanced/B path. The learned profile has its own Active switch and Reset control, while live feedback reports its current attenuation. Original/A remains a true unprocessed reference. Voice-only playback uses the VAD timeline to skip sustained non-speech sections.
 
 Whisper Recovery is a separate faint-speech preset. It raises the 2.7–4.6 kHz articulation region, uses deeper controlled compression and makeup gain, limits very high-frequency hiss, reduces the learned gate's maximum attenuation, increases speech/whisper sensitivity, and keeps RNNoise moderate so breathy consonants are less likely to be removed as noise. The whisper indicator is a spectral/energy heuristic, not identity recognition or forensic proof.
 
@@ -30,7 +30,7 @@ Whisper transcription is opt-in. The language selector supports automatic detect
 
 ## Voice Profile Analysis
 
-Voice Profile Analysis is an independent opt-in inspector module, not an enhancement preset and not part of the playback DSP. The bounded analysis worker estimates fundamental pitch and periodicity from speech-like time columns, smooths estimates over nearby voiced columns, and conservatively labels them as lower/masculine-range, higher/feminine-range, or overlapping/uncertain. The module provides a live estimate, confidence, whole-recording proportions, and a touch-seekable color timeline. All calculation remains local.
+Voice Profile Analysis is an independent opt-in landscape module below the transport, not an enhancement preset and not part of the playback DSP. The bounded analysis worker estimates fundamental pitch and periodicity from speech-like time columns, smooths estimates over nearby voiced columns, and conservatively labels them as lower/masculine-range, higher/feminine-range, or overlapping/uncertain. Its touch-seekable strip uses the same visible-window calculation and cursor ratio as the 3D spectrogram and waveform detail, while also providing a live estimate, confidence, and whole-recording proportions. All calculation remains local.
 
 This is an acoustic description rather than a gender-identity detector. Adult vocal ranges overlap, and age, vocal style, pitch shifting, noise, and recording quality can change the estimate. Whispering commonly lacks a stable fundamental pitch and is therefore shown as unavailable or uncertain instead of being guessed.
 

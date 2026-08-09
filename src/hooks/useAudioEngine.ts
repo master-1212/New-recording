@@ -28,7 +28,9 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
   const adaptiveGateRef = useRef<GainNode | null>(null);
   const transcriptionAudioRef = useRef<Float32Array | null>(null);
   const focusRef = useRef(focus);
+  const settingsRef = useRef(settings);
   const analysisRef = useRef<AnalysisData | null>(null);
+  const noiseReductionRef = useRef(0);
   const lastVoiceSkipRef = useRef(-1);
   const volumeValueRef = useRef(0.9);
   const filtersRef = useRef<{ highpass: BiquadFilterNode; low: BiquadFilterNode; presence: BiquadFilterNode; articulation: BiquadFilterNode; lowpass: BiquadFilterNode; comp: DynamicsCompressorNode; gain: GainNode } | null>(null);
@@ -42,11 +44,19 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState("");
   const [metrics, setMetrics] = useState<LiveMetrics>(emptyMetrics);
+  const [noiseReductionDb, setNoiseReductionDb] = useState(0);
   const [neuralStatus, setNeuralStatus] = useState<"off" | "loading" | "ready" | "error">("off");
   const [neuralDetail, setNeuralDetail] = useState("");
 
   useEffect(() => { focusRef.current = focus; }, [focus]);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
   useEffect(() => { analysisRef.current = analysis; }, [analysis]);
+
+  const publishNoiseReduction = useCallback((value: number) => {
+    if (Math.abs(noiseReductionRef.current - value) < 0.05) return;
+    noiseReductionRef.current = value;
+    setNoiseReductionDb(value);
+  }, []);
 
   const updateMetrics = useCallback((time: number, data = analysis) => {
     if (!data || !data.duration) return setMetrics(emptyMetrics);
@@ -80,9 +90,16 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
           const context = contextRef.current;
           if (gate && context) {
             const learnedFloor = activeFocus.noiseFloor;
-            const belowNoise = learnedFloor !== null && data.rms[index] < learnedFloor * 1.5;
-            const attenuation = belowNoise && likelihood < detectionThreshold ? (activeFocus.whisperRecovery ? 0.32 : 0.08) : 1;
+            const profileActive = activeFocus.noiseProfileEnabled && learnedFloor !== null;
+            const noiseIndex = Math.min(data.noiseFrames - 1, Math.max(0, Math.floor(time / data.duration * data.noiseFrames)));
+            const currentRms = data.noiseRms[noiseIndex] || data.rms[index];
+            const belowNoise = profileActive && currentRms < learnedFloor * 1.65;
+            const noiseAmount = belowNoise ? Math.min(1, Math.max(0, 1 - likelihood / Math.max(0.1, detectionThreshold))) : 0;
+            const whisperProtection = activeFocus.whisperRecovery ? 0.55 : 1;
+            const reductionDb = noiseAmount * (8 + settingsRef.current.suppression * 18) * whisperProtection;
+            const attenuation = Math.pow(10, -reductionDb / 20);
             gate.gain.setTargetAtTime(attenuation, context.currentTime, attenuation < 1 ? 0.035 : 0.018);
+            publishNoiseReduction(settingsRef.current.enabled ? reductionDb : 0);
           }
           if (activeFocus.voiceOnly && likelihood < detectionThreshold - 0.06 && time - lastVoiceSkipRef.current > 0.25) {
             const confirmation = Math.max(2, Math.ceil(data.columns / data.duration * 0.35));
@@ -100,13 +117,21 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
               }
             }
           }
-        }
+        } else publishNoiseReduction(0);
       }
       frameRef.current = requestAnimationFrame(tick);
     };
     frameRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frameRef.current);
-  }, [updateMetrics]);
+  }, [publishNoiseReduction, updateMetrics]);
+
+  useEffect(() => {
+    if (focus.noiseProfileEnabled && focus.noiseFloor !== null) return;
+    const gate = adaptiveGateRef.current;
+    const context = contextRef.current;
+    if (gate && context) gate.gain.setTargetAtTime(1, context.currentTime, 0.018);
+    publishNoiseReduction(0);
+  }, [focus.noiseFloor, focus.noiseProfileEnabled, publishNoiseReduction]);
 
   useEffect(() => {
     const nodes = filtersRef.current;
@@ -247,7 +272,7 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
 
   useEffect(() => () => { if (urlRef.current) URL.revokeObjectURL(urlRef.current); contextRef.current?.close(); }, []);
 
-  return { audioRef, fileName, duration, currentTime, playing, analysis, progress, error, metrics, neuralStatus, neuralDetail, loadFile, playPause, seek, skip,
+  return { audioRef, fileName, duration, currentTime, playing, analysis, progress, error, metrics, noiseReductionDb, neuralStatus, neuralDetail, loadFile, playPause, seek, skip,
     takeTranscriptionAudio: () => {
       const audio = transcriptionAudioRef.current;
       transcriptionAudioRef.current = null;
