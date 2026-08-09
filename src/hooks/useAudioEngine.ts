@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AnalysisData, EnhanceSettings, FocusSettings, LiveMetrics } from "@/types/audio";
 
-const emptyMetrics: LiveMetrics = { speech: 0, whisper: 0, peak: 0, rms: 0, dominant: 0 };
+const emptyMetrics: LiveMetrics = { speech: 0, whisper: 0, pitch: 0, profile: 0, profileConfidence: 0, peak: 0, rms: 0, dominant: 0 };
 
 function voiceLikelihood(data: AnalysisData, index: number, sensitivity: number) {
   return Math.min(1, Math.max(data.speech[index], data.whisper[index] * (0.78 + sensitivity * 0.3)));
@@ -51,7 +51,16 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
   const updateMetrics = useCallback((time: number, data = analysis) => {
     if (!data || !data.duration) return setMetrics(emptyMetrics);
     const index = Math.min(data.columns - 1, Math.max(0, Math.floor(time / data.duration * data.columns)));
-    setMetrics({ speech: data.speech[index], whisper: data.whisper[index], peak: data.peak[index], rms: data.rms[index], dominant: data.dominant[index] });
+    setMetrics({
+      speech: data.speech[index],
+      whisper: data.whisper[index],
+      pitch: data.pitch[index],
+      profile: data.profile[index],
+      profileConfidence: data.profileConfidence[index],
+      peak: data.peak[index],
+      rms: data.rms[index],
+      dominant: data.dominant[index],
+    });
   }, [analysis]);
 
   useEffect(() => {

@@ -5,6 +5,7 @@ import { Activity, AudioLines, BrainCircuit, Captions, ChevronRight, Ear, Focus,
 import { Spectrogram3D } from "./Spectrogram3D";
 import { Overview, WindowWaveform } from "./Overview";
 import { KnobSlider } from "./KnobSlider";
+import { VoiceProfilePanel } from "./VoiceProfilePanel";
 import { useAudioEngine } from "@/hooks/useAudioEngine";
 import { db, formatTime } from "@/lib/format";
 import type { EnhanceSettings, FocusSettings, TranscriptLanguage, TranscriptWord } from "@/types/audio";
@@ -218,6 +219,8 @@ export function VoiceScope() {
             <p className="diarization-note">Speaker labels are withheld: this build does not yet have a reliable local speaker-embedding model, so it will not guess who spoke.</p>
           </>}
         </div>
+
+        <VoiceProfilePanel analysis={engine.analysis} currentTime={engine.currentTime} onSeek={engine.seek}/>
 
         <div className="inspector-title metrics-title"><Gauge/><span>LIVE SIGNAL</span></div>
         <div className="voice-status"><div className={liveVoiceLikelihood >= detectionThreshold ? "pulse speaking" : "pulse"}><Activity/></div><div><span>CURRENT DETECTION</span><b>{whisperPresent ? "WHISPER-LIKE SPEECH" : liveVoiceLikelihood >= detectionThreshold ? "VOICE PRESENT" : ready ? "AMBIENT / SILENCE" : "NO SIGNAL"}</b></div></div>

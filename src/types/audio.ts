@@ -8,6 +8,9 @@ export type AnalysisData = {
   peak: Float32Array;
   speech: Float32Array;
   whisper: Float32Array;
+  pitch: Float32Array;
+  profile: Float32Array;
+  profileConfidence: Float32Array;
   dominant: Float32Array;
 };
 
@@ -38,6 +41,9 @@ export type TranscriptWord = {
 export type LiveMetrics = {
   speech: number;
   whisper: number;
+  pitch: number;
+  profile: number;
+  profileConfidence: number;
   peak: number;
   rms: number;
   dominant: number;

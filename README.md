@@ -7,7 +7,7 @@ Transport playback supports 0.5×–2× speed with pitch preservation, ±10-seco
 ## Architecture
 
 - `src/hooks/useAudioEngine.ts` owns decoding, transport synchronization, the Web Audio graph, and DSP state.
-- `src/workers/analyze.worker.ts` creates bounded-resolution waveform, log-frequency spectral, level, dominant-frequency, voice-activity, and whisper-likelihood data off the UI thread.
+- `src/workers/analyze.worker.ts` creates bounded-resolution waveform, log-frequency spectral, level, dominant-frequency, voice-activity, whisper-likelihood, and acoustic voice-profile data off the UI thread.
 - `src/workers/transcribe.worker.ts` lazily loads Whisper in a dedicated worker and returns clickable word-level timestamps without uploading the recording.
 - `src/components/Spectrogram3D.tsx` renders only a playback-centered spectral window on the GPU. Orbit controls provide mouse/touch rotation, pinch zoom, and pan.
 - `src/components/Overview.tsx` draws both a zoomed waveform synchronized to the 3D visible window and the full-recording heatmap, waveform, VAD, and seek cursor. Both views use the same clamped time-range function, including near the beginning and end of a recording.
@@ -27,6 +27,12 @@ Whisper Recovery is a separate faint-speech preset. It raises the 2.7–4.6 kHz 
 ## Local Whisper transcription
 
 Whisper transcription is opt-in. The language selector supports automatic detection plus explicit English, Hindi, and Marathi modes. Explicit language selection is recommended for muffled recordings. On first use, the browser downloads the quantized multilingual `whisper-tiny_timestamped` model and caches it; inference then runs locally on 16 kHz audio in a Web Worker. Words are timestamped and can be tapped to seek, and the same loaded recording can be retranscribed in another language without decoding it again. After each run, the worker returns the downsampled audio buffer and terminates so its model memory is released—important on iPad. Audio is never sent to the CDN or model host: those services provide code/model assets only. A small same-origin Vercel route proxies and caches allowlisted runtime assets so Safari content blockers do not have to permit third-party executable files; it never accepts or transmits user audio. An internet connection is required the first time RNNoise or Whisper is enabled.
+
+## Voice Profile Analysis
+
+Voice Profile Analysis is an independent opt-in inspector module, not an enhancement preset and not part of the playback DSP. The bounded analysis worker estimates fundamental pitch and periodicity from speech-like time columns, smooths estimates over nearby voiced columns, and conservatively labels them as lower/masculine-range, higher/feminine-range, or overlapping/uncertain. The module provides a live estimate, confidence, whole-recording proportions, and a touch-seekable color timeline. All calculation remains local.
+
+This is an acoustic description rather than a gender-identity detector. Adult vocal ranges overlap, and age, vocal style, pitch shifting, noise, and recording quality can change the estimate. Whispering commonly lacks a stable fundamental pitch and is therefore shown as unavailable or uncertain instead of being guessed.
 
 ## Browser compatibility
 
@@ -55,4 +61,4 @@ No backend or environment variables are required. Import the repository into Ver
 
 VAD and whisper likelihood are energy, spectral-ratio, and zero-crossing estimates and may classify music or hiss as voice, so voice-only playback can occasionally skip faint speech or retain non-speech. Increase sensitivity when speech is being missed; reduce it when too much background passes through. RNNoise and DSP can reveal captured speech components but cannot reconstruct words that were never recorded. Whisper output must be treated as an aid, not forensic proof; explicit Hindi or Marathi selection generally works better than auto detection on muffled audio.
 
-Speaker diarization is intentionally not shown. VoiceScope does not yet ship a sufficiently reliable local speaker-embedding model, and assigning guessed Speaker 1/2 labels would be misleading. Reliable diarization, export of cleaned audio, spectral editing, pitch/formant/harmonic tools, and voice comparison remain roadmap items.
+Speaker diarization is intentionally not shown. VoiceScope does not yet ship a sufficiently reliable local speaker-embedding model, and assigning guessed Speaker 1/2 labels would be misleading. Voice Profile Analysis describes acoustic pitch presentation but does not establish whether two regions belong to the same person. Reliable diarization, export of cleaned audio, spectral editing, formant/harmonic tools, and voice comparison remain roadmap items.
