@@ -2,7 +2,10 @@ export type AnalysisData = {
   duration: number;
   columns: number;
   bands: number;
+  sampleRate: number;
+  totalSamples: number;
   waveform: Float32Array;
+  overviewWaveform: Float32Array;
   spectral: Uint8Array;
   rms: Float32Array;
   peak: Float32Array;

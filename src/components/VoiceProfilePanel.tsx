@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { AudioWaveform, Info, UsersRound } from "lucide-react";
+import { analysisFrameAtTime, analysisFrameDuration } from "@/lib/analysisClock";
 import { formatTime } from "@/lib/format";
 import { getVisibleTimeRange } from "@/lib/timeWindow";
 import type { AnalysisData } from "@/types/audio";
@@ -27,7 +28,7 @@ function classifyProfile(pitch: number, profile: number, confidence: number, spe
 
 function profileAt(analysis: AnalysisData | null, time: number) {
   if (!analysis?.duration) return classifyProfile(0, 0, 0, 0);
-  const index = Math.min(analysis.columns - 1, Math.max(0, Math.floor(time / analysis.duration * analysis.columns)));
+  const index = analysisFrameAtTime(analysis, time);
   return classifyProfile(analysis.pitch[index], analysis.profile[index], analysis.profileConfidence[index], analysis.speech[index]);
 }
 
@@ -35,8 +36,10 @@ export function VoiceProfilePanel({ analysis, currentTime, windowSeconds, onSeek
   const [enabled, setEnabled] = useState(false);
   const range = getVisibleTimeRange(currentTime, analysis?.duration ?? 0, windowSeconds);
   const current = profileAt(analysis, currentTime);
-  const startColumn = analysis?.duration ? Math.floor(range.start / analysis.duration * analysis.columns) : 0;
-  const endColumn = analysis?.duration ? Math.max(startColumn + 1, Math.ceil(range.end / analysis.duration * analysis.columns)) : 0;
+  const sampleSignature = analysis ? Array.from({ length: PROFILE_COLUMNS }, (_, slot) => analysisFrameAtTime(
+    analysis,
+    range.start + range.span * slot / (PROFILE_COLUMNS - 1),
+  )).join(",") : "";
   const counts = useMemo(() => {
     const result = { lower: 0, higher: 0, uncertain: 0, voiced: 0 };
     if (!analysis) return result;
@@ -51,37 +54,27 @@ export function VoiceProfilePanel({ analysis, currentTime, windowSeconds, onSeek
     }
     return result;
   }, [analysis]);
-  const timeline = useMemo(() => Array.from({ length: PROFILE_COLUMNS }, (_, slot) => {
-    if (!analysis || endColumn <= startColumn) return { kind: "none" as ProfileKind, confidence: 0 };
-    const start = Math.floor(startColumn + slot / PROFILE_COLUMNS * (endColumn - startColumn));
-    const end = Math.max(start + 1, Math.floor(startColumn + (slot + 1) / PROFILE_COLUMNS * (endColumn - startColumn)));
-    let weightedProfile = 0, weight = 0, strongestConfidence = 0, pitchSum = 0, pitchCount = 0, speech = 0;
-    for (let index = start; index < Math.min(end, analysis.columns); index++) {
+  const timeline = useMemo(() => {
+    if (!analysis) return Array.from({ length: PROFILE_COLUMNS }, () => ({ kind: "none" as ProfileKind, confidence: 0 }));
+    return sampleSignature.split(",").map((value) => {
+      const index = Number(value);
       const sample = classifyProfile(analysis.pitch[index], analysis.profile[index], analysis.profileConfidence[index], analysis.speech[index]);
-      if (sample.kind === "none") continue;
-      const sampleWeight = Math.max(0.08, sample.confidence) * analysis.speech[index];
-      weightedProfile += analysis.profile[index] * sampleWeight;
-      weight += sampleWeight;
-      strongestConfidence = Math.max(strongestConfidence, sample.confidence);
-      pitchSum += sample.pitch;
-      pitchCount++;
-      speech = Math.max(speech, analysis.speech[index]);
-    }
-    const profile = weight ? weightedProfile / weight : 0;
-    const sample = classifyProfile(pitchCount ? pitchSum / pitchCount : 0, profile, strongestConfidence, speech);
-    return { kind: sample.kind, confidence: sample.confidence };
-  }), [analysis, endColumn, startColumn]);
+      return { kind: sample.kind, confidence: sample.confidence };
+    });
+  }, [analysis, sampleSignature]);
   const timelineColumns = useMemo(() => timeline.map((segment, index) => <i
     key={index}
     className={segment.kind}
     style={{ opacity: segment.kind === "none" ? 0.18 : 0.35 + segment.confidence * 0.65 }}
   />), [timeline]);
   const percentage = (count: number) => counts.voiced ? Math.round(count / counts.voiced * 100) : 0;
+  const resolution = analysis ? analysisFrameDuration(analysis) : 0;
+  const resolutionLabel = resolution < 1 ? `${Math.round(resolution * 1000)} ms` : `${resolution.toFixed(2)} s`;
 
   return <section className="profile-landscape" aria-label="Independent acoustic voice profile analysis">
     <div className="profile-landscape-head">
       <div className="profile-icon"><AudioWaveform/></div>
-      <span><b><UsersRound/> Voice Profile Classification</b><small>Independent local pitch analysis · synchronized visible window</small></span>
+      <span><b><UsersRound/> Voice Profile Classification</b><small>Canonical centered frames · synchronized window · {analysis ? resolutionLabel : "awaiting analysis"} resolution</small></span>
       <button role="switch" aria-label="Enable voice profile classification" aria-checked={enabled} className={enabled ? "toggle on" : "toggle"} onClick={() => setEnabled((active) => !active)} disabled={!analysis}><i/></button>
     </div>
     {enabled ? <div className="profile-landscape-body">

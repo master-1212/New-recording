@@ -9,12 +9,15 @@ Transport playback supports 0.5×–2× speed with pitch preservation, ±10-seco
 - `src/hooks/useAudioEngine.ts` owns decoding, transport synchronization, the Web Audio graph, and DSP state.
 - `src/workers/analyze.worker.ts` creates bounded-resolution waveform, log-frequency spectral, level, dominant-frequency, voice-activity, whisper-likelihood, acoustic voice-profile data, and a capped high-resolution noise envelope off the UI thread.
 - `src/workers/transcribe.worker.ts` lazily loads Whisper in a dedicated worker and returns clickable word-level timestamps without uploading the recording.
+- `src/lib/audioSession.ts` provides best-effort 24-hour crash/reload recovery using an IndexedDB recording blob and a small versioned playback snapshot in local storage.
 - `src/components/Spectrogram3D.tsx` renders only a playback-centered spectral window on the GPU. Orbit controls provide mouse/touch rotation, pinch zoom, and pan.
 - `src/components/Overview.tsx` draws both a zoomed waveform synchronized to the 3D visible window and the full-recording heatmap, waveform, VAD, and seek cursor. Both views use the same clamped time-range function, including near the beginning and end of a recording.
 
 ## Spectrogram and performance
 
-Audio is decoded once and mixed to mono for analysis. The worker caps the overview at 1,800 time columns and 72 logarithmic frequency bands, transferring typed-array buffers without copying. A separate 10 Hz noise envelope is capped at 36,000 frames (about 144 KB) so five-second noise learning remains precise on long recordings. The 3D surface samples only 96 × 36 vertices around the playhead. React does not hold per-frame FFT data, and the complete spectrogram is never recomputed during playback. This tiered resolution keeps memory bounded for 30–60 minute recordings.
+Audio is decoded once for the initial analysis and mixed to mono. The worker uses a shared sample-based clock and caps analysis at 12,000 time columns (targeting four columns per second) and 72 logarithmic frequency bands, transferring typed-array buffers without copying. It keeps local FFT-window peaks separate from whole-column overview peaks so the waveform, spectral surface, and playhead refer to the same time frames. A separate 10 Hz noise envelope is capped at 36,000 frames (about 144 KB) so five-second noise learning remains precise on long recordings. The 3D surface samples only 96 × 36 vertices around the playhead, renders on demand, and explicitly disposes replaced GPU geometries. Playback-facing React state is bounded to about 15 updates per second, and the expensive full-recording heatmap is painted only when analysis or its display size changes. This tiered resolution keeps memory and CPU use bounded for 30–60 minute recordings.
+
+The app does not retain a full-length 16 kHz transcription copy during ordinary playback. It creates that temporary PCM data only after the user enables transcription, transfers it to the worker, and releases it when the worker finishes or is cancelled. RNNoise is also disconnected when its slider returns to zero. These choices substantially reduce steady-state memory pressure on iPad Safari.
 
 ## Voice Enhance DSP
 
@@ -26,7 +29,11 @@ Whisper Recovery is a separate faint-speech preset. It raises the 2.7–4.6 kHz 
 
 ## Local Whisper transcription
 
-Whisper transcription is opt-in. The language selector supports automatic detection plus explicit English, Hindi, and Marathi modes. Explicit language selection is recommended for muffled recordings. On first use, the browser downloads the quantized multilingual `whisper-tiny_timestamped` model and caches it; inference then runs locally on 16 kHz audio in a Web Worker. Words are timestamped and can be tapped to seek, and the same loaded recording can be retranscribed in another language without decoding it again. After each run, the worker returns the downsampled audio buffer and terminates so its model memory is released—important on iPad. Audio is never sent to the CDN or model host: those services provide code/model assets only. A small same-origin Vercel route proxies and caches allowlisted runtime assets so Safari content blockers do not have to permit third-party executable files; it never accepts or transmits user audio. An internet connection is required the first time RNNoise or Whisper is enabled.
+Whisper transcription is opt-in. The language selector supports automatic detection plus explicit English, Hindi, and Marathi modes. Explicit language selection is recommended for muffled recordings. On first use, the browser downloads the quantized multilingual `whisper-tiny_timestamped` model and caches it; inference then runs locally on temporary 16 kHz audio in a Web Worker. Words are timestamped and can be tapped to seek. Each transcription run prepares its own temporary speech-rate copy and terminates the worker afterward so neither the PCM data nor model remains in live application memory—important on iPad. Audio is never sent to the CDN or model host: those services provide code/model assets only. A small same-origin Vercel route proxies and caches allowlisted runtime assets so Safari content blockers do not have to permit third-party executable files; it never accepts or transmits user audio. An internet connection is required the first time RNNoise or Whisper is enabled.
+
+## Reload recovery and privacy
+
+After a recording decodes successfully, VoiceScope makes a best-effort recovery copy in the browser's IndexedDB and saves playback position, speed, loop, and volume every three seconds and whenever the page is hidden. If iPad Safari evicts or reloads the tab, the app automatically restores the recording and position but remains paused because iOS blocks autoplay without a tap. Recovery data stays on the device, expires after 24 hours, is replaced by the next recording, and can be removed immediately with **Forget recovery copy**. Private browsing, storage quotas, or very large files can prevent recovery; the UI reports that state rather than claiming protection.
 
 ## Voice Profile Analysis
 
@@ -36,7 +43,7 @@ This is an acoustic description rather than a gender-identity detector. Adult vo
 
 ## Browser compatibility
 
-Designed for current Safari on iPad/iPhone and current Safari, Chrome, Edge, and Firefox on desktop. Codec support is supplied by the browser/OS; WAV and MP3 are the most portable. iOS requires a user gesture before audio starts. Very large compressed recordings may hit Safari's decode-memory ceiling because `decodeAudioData` does not stream. Local Whisper is demanding on older iPads, and the tiny multilingual model trades accuracy for memory and speed—especially on severely muffled speech or recordings that switch languages mid-sentence.
+Designed for current Safari on iPad/iPhone and current Safari, Chrome, Edge, and Firefox on desktop. Codec support is supplied by the browser/OS; WAV and MP3 are the most portable. iOS requires a user gesture before audio starts, including after an automatic recovery. Very large compressed recordings may hit Safari's decode-memory ceiling because `decodeAudioData` does not stream. Local Whisper is demanding on older iPads, and the tiny multilingual model trades accuracy for memory and speed—especially on severely muffled speech or recordings that switch languages mid-sentence.
 
 ## Local development
 

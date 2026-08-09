@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { analysisFrameAtTime } from "@/lib/analysisClock";
 import type { AnalysisData, EnhanceSettings, FocusSettings, LiveMetrics } from "@/types/audio";
 
 const emptyMetrics: LiveMetrics = { speech: 0, whisper: 0, pitch: 0, profile: 0, profileConfidence: 0, peak: 0, rms: 0, dominant: 0 };
@@ -26,7 +27,11 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
   const rnnoiseRef = useRef<AudioWorkletNode | null>(null);
   const rnnoisePromiseRef = useRef<Promise<void> | null>(null);
   const adaptiveGateRef = useRef<GainNode | null>(null);
-  const transcriptionAudioRef = useRef<Float32Array | null>(null);
+  const fileRef = useRef<File | null>(null);
+  const analysisWorkerRef = useRef<Worker | null>(null);
+  const pendingSeekRef = useRef(0);
+  const loadGenerationRef = useRef(0);
+  const transcriptionPromiseRef = useRef<Promise<Float32Array | null> | null>(null);
   const focusRef = useRef(focus);
   const settingsRef = useRef(settings);
   const analysisRef = useRef<AnalysisData | null>(null);
@@ -36,6 +41,8 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
   const filtersRef = useRef<{ highpass: BiquadFilterNode; low: BiquadFilterNode; presence: BiquadFilterNode; articulation: BiquadFilterNode; lowpass: BiquadFilterNode; comp: DynamicsCompressorNode; gain: GainNode } | null>(null);
   const urlRef = useRef<string | null>(null);
   const frameRef = useRef(0);
+  const lastUiFrameRef = useRef(0);
+  const lastReportedTimeRef = useRef(-1);
   const [fileName, setFileName] = useState("");
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
@@ -60,7 +67,7 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
 
   const updateMetrics = useCallback((time: number, data = analysis) => {
     if (!data || !data.duration) return setMetrics(emptyMetrics);
-    const index = Math.min(data.columns - 1, Math.max(0, Math.floor(time / data.duration * data.columns)));
+    const index = analysisFrameAtTime(data, time);
     setMetrics({
       speech: data.speech[index],
       whisper: data.whisper[index],
@@ -74,16 +81,20 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
   }, [analysis]);
 
   useEffect(() => {
-    const tick = () => {
+    const tick = (timestamp: number) => {
       const audio = audioRef.current;
-      if (audio) {
+      if (audio && timestamp - lastUiFrameRef.current >= 66) {
+        lastUiFrameRef.current = timestamp;
         const time = audio.currentTime;
-        setCurrentTime(time);
-        updateMetrics(time);
+        if (Math.abs(time - lastReportedTimeRef.current) >= 0.015) {
+          lastReportedTimeRef.current = time;
+          setCurrentTime(time);
+          updateMetrics(time);
+        }
         const data = analysisRef.current;
         const activeFocus = focusRef.current;
         if (data?.duration && !audio.paused) {
-          const index = Math.min(data.columns - 1, Math.floor(time / data.duration * data.columns));
+          const index = analysisFrameAtTime(data, time);
           const likelihood = voiceLikelihood(data, index, activeFocus.speechSensitivity);
           const detectionThreshold = 0.68 - activeFocus.speechSensitivity * 0.36;
           const gate = adaptiveGateRef.current;
@@ -206,6 +217,9 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
       }
     })();
     rnnoisePromiseRef.current = task;
+    void task.finally(() => {
+      if (rnnoisePromiseRef.current === task) rnnoisePromiseRef.current = null;
+    });
     return task;
   }, []);
 
@@ -214,49 +228,104 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
     const dry = neuralDryRef.current;
     const wet = neuralWetRef.current;
     if (!context || !dry || !wet) return;
+    if (focus.neuralDenoise === 0) {
+      dry.gain.setTargetAtTime(1, context.currentTime, 0.035);
+      wet.gain.setTargetAtTime(0, context.currentTime, 0.035);
+      const node = rnnoiseRef.current;
+      if (node) {
+        try { sourceRef.current?.disconnect(node); } catch { /* Already disconnected. */ }
+        node.disconnect();
+        node.port.close();
+        rnnoiseRef.current = null;
+      }
+      return;
+    }
     if (focus.neuralDenoise > 0 && !rnnoiseRef.current) void initRnnoise();
     const amount = rnnoiseRef.current ? focus.neuralDenoise : 0;
     dry.gain.setTargetAtTime(Math.cos(amount * Math.PI / 2), context.currentTime, 0.035);
     wet.gain.setTargetAtTime(Math.sin(amount * Math.PI / 2), context.currentTime, 0.035);
-    if (amount === 0 && neuralStatus === "ready") setNeuralStatus("off");
-    if (amount > 0 && neuralStatus === "off") setNeuralStatus("ready");
-  }, [focus.neuralDenoise, initRnnoise, neuralStatus]);
+  }, [focus.neuralDenoise, initRnnoise]);
 
-  const loadFile = useCallback(async (file: File) => {
-    setError(""); setProgress(0.01); setAnalysis(null); setFileName(file.name);
+  const loadFile = useCallback(async (file: File, resumeAt = 0) => {
+    const generation = ++loadGenerationRef.current;
+    analysisWorkerRef.current?.terminate();
+    analysisWorkerRef.current = null;
+    audioRef.current?.pause();
+    setPlaying(false); setError(""); setProgress(0.01); setAnalysis(null); setFileName(file.name);
+    fileRef.current = file;
+    pendingSeekRef.current = Math.max(0, resumeAt);
     try {
       const data = await file.arrayBuffer();
       const decodeContext = new AudioContext();
-      const buffer = await decodeContext.decodeAudioData(data.slice(0));
+      const buffer = await decodeContext.decodeAudioData(data);
+      if (generation !== loadGenerationRef.current) {
+        await decodeContext.close();
+        return false;
+      }
       const mono = new Float32Array(buffer.length);
       for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
         const input = buffer.getChannelData(channel);
         for (let i = 0; i < input.length; i++) mono[i] += input[i] / buffer.numberOfChannels;
       }
-      const ratio = buffer.sampleRate / 16000;
-      const transcriptionAudio = new Float32Array(Math.ceil(mono.length / ratio));
-      for (let i = 0; i < transcriptionAudio.length; i++) {
-        const start = Math.floor(i * ratio), end = Math.min(mono.length, Math.floor((i + 1) * ratio));
-        let sum = 0;
-        for (let j = start; j < end; j++) sum += mono[j];
-        transcriptionAudio[i] = sum / Math.max(1, end - start);
-      }
-      transcriptionAudioRef.current = transcriptionAudio;
+      const decodedDuration = buffer.duration;
+      const sampleRate = buffer.sampleRate;
       await decodeContext.close();
-      const worker = new Worker(new URL("../workers/analyze.worker.ts", import.meta.url));
+      const worker = new Worker(new URL("../workers/analyze.worker.ts", import.meta.url), { type: "module" });
+      analysisWorkerRef.current = worker;
       worker.onmessage = ({ data: message }) => {
+        if (generation !== loadGenerationRef.current) return worker.terminate();
         if (message.type === "progress") setProgress(message.progress);
-        if (message.type === "complete") { setAnalysis(message.analysis); setProgress(1); worker.terminate(); }
+        if (message.type === "complete") { setAnalysis(message.analysis); setProgress(1); worker.terminate(); analysisWorkerRef.current = null; }
       };
-      worker.onerror = () => { setError("The recording decoded, but spectral analysis could not finish."); worker.terminate(); };
-      worker.postMessage({ samples: mono, sampleRate: buffer.sampleRate, duration: buffer.duration }, [mono.buffer]);
+      worker.onerror = () => { setError("The recording decoded, but spectral analysis could not finish."); worker.terminate(); analysisWorkerRef.current = null; };
+      worker.postMessage({ samples: mono, sampleRate, duration: decodedDuration }, [mono.buffer]);
       if (urlRef.current) URL.revokeObjectURL(urlRef.current);
       const url = URL.createObjectURL(file); urlRef.current = url;
       if (audioRef.current) { audioRef.current.src = url; audioRef.current.load(); }
-      setDuration(buffer.duration);
+      setDuration(decodedDuration);
+      setCurrentTime(Math.min(decodedDuration, pendingSeekRef.current));
+      return true;
     } catch {
+      if (generation !== loadGenerationRef.current) return false;
+      fileRef.current = null;
+      setFileName("");
       setError("This browser could not decode that audio file. Try WAV, MP3, M4A, or AAC.");
       setProgress(0);
+      return false;
+    }
+  }, []);
+
+  const prepareTranscriptionAudio = useCallback(async () => {
+    if (transcriptionPromiseRef.current) return transcriptionPromiseRef.current;
+    const file = fileRef.current;
+    const generation = loadGenerationRef.current;
+    if (!file) return null;
+    const task = (async () => {
+      const decodeContext = new AudioContext();
+      try {
+        const buffer = await decodeContext.decodeAudioData(await file.arrayBuffer());
+        if (generation !== loadGenerationRef.current) return null;
+        const targetRate = 16000;
+        const ratio = buffer.sampleRate / targetRate;
+        const output = new Float32Array(Math.ceil(buffer.length / ratio));
+        const channels = Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel));
+        for (let index = 0; index < output.length; index++) {
+          const start = Math.floor(index * ratio);
+          const end = Math.min(buffer.length, Math.max(start + 1, Math.floor((index + 1) * ratio)));
+          let sum = 0;
+          for (const channel of channels) for (let sample = start; sample < end; sample++) sum += channel[sample];
+          output[index] = sum / Math.max(1, (end - start) * channels.length);
+        }
+        return generation === loadGenerationRef.current ? output : null;
+      } finally {
+        await decodeContext.close();
+      }
+    })();
+    transcriptionPromiseRef.current = task;
+    try {
+      return await task;
+    } finally {
+      transcriptionPromiseRef.current = null;
     }
   }, []);
 
@@ -269,27 +338,47 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
   }, [ensureGraph, initRnnoise]);
   const seek = useCallback((time: number) => { if (!audioRef.current) return; audioRef.current.currentTime = Math.max(0, Math.min(duration, time)); setCurrentTime(audioRef.current.currentTime); updateMetrics(audioRef.current.currentTime); }, [duration, updateMetrics]);
   const skip = useCallback((delta: number) => seek((audioRef.current?.currentTime || 0) + delta), [seek]);
+  const getCurrentTime = useCallback(() => audioRef.current?.currentTime ?? 0, []);
+  const setRate = useCallback((value: number) => {
+    if (!audioRef.current) return;
+    audioRef.current.preservesPitch = true;
+    audioRef.current.playbackRate = Math.max(0.5, Math.min(2, value));
+  }, []);
+  const setVolume = useCallback((value: number) => {
+    const safeValue = Math.max(0, Math.min(5, value));
+    volumeValueRef.current = safeValue;
+    const context = contextRef.current;
+    if (context && masterGainRef.current) masterGainRef.current.gain.setTargetAtTime(safeValue, context.currentTime, 0.015);
+  }, []);
+  const setLoop = useCallback((value: boolean) => {
+    if (audioRef.current) audioRef.current.loop = value;
+  }, []);
 
-  useEffect(() => () => { if (urlRef.current) URL.revokeObjectURL(urlRef.current); contextRef.current?.close(); }, []);
+  useEffect(() => () => {
+    analysisWorkerRef.current?.terminate();
+    if (urlRef.current) URL.revokeObjectURL(urlRef.current);
+    contextRef.current?.close();
+  }, []);
 
   return { audioRef, fileName, duration, currentTime, playing, analysis, progress, error, metrics, noiseReductionDb, neuralStatus, neuralDetail, loadFile, playPause, seek, skip,
-    takeTranscriptionAudio: () => {
-      const audio = transcriptionAudioRef.current;
-      transcriptionAudioRef.current = null;
-      return audio;
-    },
-    setRate: (v: number) => {
-      if (!audioRef.current) return;
-      audioRef.current.preservesPitch = true;
-      audioRef.current.playbackRate = Math.max(0.5, Math.min(2, v));
-    },
-    setVolume: (v: number) => {
-      const safeValue = Math.max(0, Math.min(5, v));
-      volumeValueRef.current = safeValue;
-      const context = contextRef.current;
-      if (context && masterGainRef.current) masterGainRef.current.gain.setTargetAtTime(safeValue, context.currentTime, 0.015);
-    },
-    setLoop: (v: boolean) => { if (audioRef.current) audioRef.current.loop = v; },
-    events: { onPlay: () => setPlaying(true), onPause: () => setPlaying(false), onEnded: () => setPlaying(false), onDurationChange: () => setDuration(audioRef.current?.duration || duration) }
+    prepareTranscriptionAudio,
+    getCurrentTime,
+    setRate,
+    setVolume,
+    setLoop,
+    events: {
+      onPlay: () => setPlaying(true),
+      onPause: () => { setPlaying(false); setCurrentTime(audioRef.current?.currentTime ?? 0); },
+      onEnded: () => setPlaying(false),
+      onLoadedMetadata: () => {
+        const audio = audioRef.current;
+        if (!audio) return;
+        const target = Math.min(Number.isFinite(audio.duration) ? audio.duration : duration, pendingSeekRef.current);
+        audio.currentTime = target;
+        setCurrentTime(target);
+        pendingSeekRef.current = 0;
+      },
+      onDurationChange: () => setDuration(audioRef.current?.duration || duration),
+    }
   };
 }

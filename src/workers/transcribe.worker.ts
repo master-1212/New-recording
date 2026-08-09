@@ -77,17 +77,14 @@ self.onmessage = async ({ data }: MessageEvent<{ audio?: Float32Array; language:
       const end = rawEnd ?? start;
       return Number.isFinite(start) ? [{ text: chunk.text, start, end }] : [];
     });
-    const audio = cachedAudio;
     cachedAudio = null;
-    self.postMessage({ type: "complete", text: result.text ?? "", words, audio }, audio ? [audio.buffer] : []);
+    self.postMessage({ type: "complete", text: result.text ?? "", words });
   } catch (cause) {
-    const audio = cachedAudio;
     cachedAudio = null;
     self.postMessage({
       type: "error",
       error: cause instanceof Error ? cause.message : "Local transcription could not start.",
-      audio,
-    }, audio ? [audio.buffer] : []);
+    });
   } finally {
     transcribing = false;
   }

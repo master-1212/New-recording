@@ -2,23 +2,29 @@
 
 import { Canvas } from "@react-three/fiber";
 import { Grid, OrbitControls, PerspectiveCamera } from "@react-three/drei";
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import * as THREE from "three";
+import { analysisFrameAtTime } from "@/lib/analysisClock";
 import type { AnalysisData } from "@/types/audio";
 import { getVisibleTimeRange } from "@/lib/timeWindow";
 
+const TIME_STEPS = 96;
+
 function Surface({ analysis, currentTime, windowSeconds, depth }: { analysis: AnalysisData; currentTime: number; windowSeconds: number; depth: number }) {
   const range = getVisibleTimeRange(currentTime, analysis.duration, windowSeconds);
-  const first = Math.max(0, Math.floor((range.start / analysis.duration) * analysis.columns));
-  const last = Math.min(analysis.columns - 1, Math.ceil((range.end / analysis.duration) * analysis.columns));
+  const sampleSignature = Array.from({ length: TIME_STEPS }, (_, step) => analysisFrameAtTime(
+    analysis,
+    range.start + range.span * step / (TIME_STEPS - 1),
+  )).join(",");
   const geometry = useMemo(() => {
-    const frequencySteps = 36, timeSteps = 96;
+    const frequencySteps = 36, timeSteps = TIME_STEPS;
+    const sampledColumns = sampleSignature.split(",").map(Number);
     const vertices = new Float32Array(timeSteps * frequencySteps * 3);
     const colors = new Float32Array(timeSteps * frequencySteps * 3);
     const indices: number[] = [];
     const color = new THREE.Color();
     for (let x = 0; x < timeSteps; x++) {
-      const column = Math.round(first + (last - first) * x / (timeSteps - 1));
+      const column = sampledColumns[x];
       for (let y = 0; y < frequencySteps; y++) {
         const band = Math.floor(y / (frequencySteps - 1) * (analysis.bands - 1));
         const power = analysis.spectral[column * analysis.bands + band] / 255;
@@ -39,7 +45,8 @@ function Surface({ analysis, currentTime, windowSeconds, depth }: { analysis: An
     result.setAttribute("color", new THREE.BufferAttribute(colors, 3));
     result.setIndex(indices); result.computeVertexNormals();
     return result;
-  }, [analysis, depth, first, last]);
+  }, [analysis, depth, sampleSignature]);
+  useEffect(() => () => geometry.dispose(), [geometry]);
   return <mesh geometry={geometry}><meshStandardMaterial vertexColors side={THREE.DoubleSide} roughness={0.7} metalness={0.12} /></mesh>;
 }
 
@@ -48,7 +55,7 @@ export function Spectrogram3D(props: { analysis: AnalysisData | null; currentTim
   const cursorX = range ? (range.cursorRatio - 0.5) * 12 : 0;
   return <div className="three-stage" aria-label="Interactive 3D spectrogram">
     {!props.analysis && <div className="empty-visual"><div className="empty-rings"/><span>SPECTRAL FIELD STANDBY</span><p>Load a recording to construct the frequency surface</p></div>}
-    {props.analysis && <Canvas dpr={[1, 1.5]} gl={{ antialias: true, powerPreference: "high-performance" }} fallback={<div className="webgl-fallback"><span>3D VIEW UNAVAILABLE</span><p>The synchronized waveform and heatmap remain active.</p></div>}>
+    {props.analysis && <Canvas frameloop="demand" dpr={[1, 1.5]} gl={{ antialias: true, powerPreference: "high-performance" }} fallback={<div className="webgl-fallback"><span>3D VIEW UNAVAILABLE</span><p>The synchronized waveform and heatmap remain active.</p></div>}>
       <color attach="background" args={["#07100f"]}/><fog attach="fog" args={["#07100f", 8, 22]}/>
       <PerspectiveCamera makeDefault position={[8.4, 6.5, 9.4]} fov={45}/>
       <ambientLight intensity={0.65}/><directionalLight position={[2, 8, 4]} intensity={2.2} color="#85ffe4"/>

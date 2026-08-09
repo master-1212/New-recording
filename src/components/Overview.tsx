@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
+import { analysisFrameAtTime } from "@/lib/analysisClock";
 import type { AnalysisData } from "@/types/audio";
 import { getVisibleTimeRange } from "@/lib/timeWindow";
 
@@ -8,32 +9,47 @@ export function Overview({ analysis, currentTime, duration, onSeek }: { analysis
   const canvasRef = useRef<HTMLCanvasElement>(null);
   useEffect(() => {
     const canvas = canvasRef.current; if (!canvas) return;
-    const rect = canvas.getBoundingClientRect(), ratio = Math.min(2, devicePixelRatio || 1);
-    canvas.width = Math.max(1, rect.width * ratio); canvas.height = Math.max(1, rect.height * ratio);
-    const ctx = canvas.getContext("2d"); if (!ctx) return;
-    ctx.scale(ratio, ratio); const w = rect.width, h = rect.height;
-    ctx.fillStyle = "#081311"; ctx.fillRect(0, 0, w, h);
-    if (!analysis) return;
-    const heatHeight = h * 0.52;
-    for (let x = 0; x < Math.ceil(w); x++) {
-      const col = Math.min(analysis.columns - 1, Math.floor(x / w * analysis.columns));
-      for (let y = 0; y < 28; y++) {
-        const band = Math.floor((1 - y / 28) * (analysis.bands - 1));
-        const p = analysis.spectral[col * analysis.bands + band] / 255;
-        ctx.fillStyle = `hsla(${190 - p * 150},90%,${12 + p * 55}%,${0.2 + p * 0.8})`;
-        ctx.fillRect(x, y / 28 * heatHeight, 1.2, heatHeight / 28 + 1);
+    const draw = () => {
+      const rect = canvas.getBoundingClientRect(), ratio = Math.min(2, devicePixelRatio || 1);
+      canvas.width = Math.max(1, rect.width * ratio); canvas.height = Math.max(1, rect.height * ratio);
+      const ctx = canvas.getContext("2d"); if (!ctx) return;
+      ctx.scale(ratio, ratio); const w = rect.width, h = rect.height;
+      ctx.fillStyle = "#081311"; ctx.fillRect(0, 0, w, h);
+      if (!analysis) return;
+      const heatHeight = h * 0.52;
+      for (let x = 0; x < Math.ceil(w); x++) {
+        const col = analysisFrameAtTime(analysis, x / w * analysis.duration);
+        for (let y = 0; y < 28; y++) {
+          const band = Math.floor((1 - y / 28) * (analysis.bands - 1));
+          const p = analysis.spectral[col * analysis.bands + band] / 255;
+          ctx.fillStyle = `hsla(${190 - p * 150},90%,${12 + p * 55}%,${0.2 + p * 0.8})`;
+          ctx.fillRect(x, y / 28 * heatHeight, 1.2, heatHeight / 28 + 1);
+        }
+        const voiceLikelihood = Math.max(analysis.speech[col], analysis.whisper[col] * 0.9);
+        if (voiceLikelihood > 0.52) { ctx.fillStyle = `rgba(107,255,207,${voiceLikelihood * 0.32})`; ctx.fillRect(x, heatHeight, 1.5, h - heatHeight); }
+        const mid = heatHeight + (h - heatHeight) / 2, amp = (h - heatHeight) * 0.43;
+        ctx.strokeStyle = "#75e8ce"; ctx.globalAlpha = 0.72; ctx.beginPath();
+        ctx.moveTo(x, mid + analysis.overviewWaveform[col * 2] * amp); ctx.lineTo(x, mid + analysis.overviewWaveform[col * 2 + 1] * amp); ctx.stroke(); ctx.globalAlpha = 1;
       }
-      const voiceLikelihood = Math.max(analysis.speech[col], analysis.whisper[col] * 0.9);
-      if (voiceLikelihood > 0.52) { ctx.fillStyle = `rgba(107,255,207,${voiceLikelihood * 0.32})`; ctx.fillRect(x, heatHeight, 1.5, h - heatHeight); }
-      const mid = heatHeight + (h - heatHeight) / 2, amp = (h - heatHeight) * 0.43;
-      ctx.strokeStyle = "#75e8ce"; ctx.globalAlpha = 0.72; ctx.beginPath();
-      ctx.moveTo(x, mid + analysis.waveform[col * 2] * amp); ctx.lineTo(x, mid + analysis.waveform[col * 2 + 1] * amp); ctx.stroke(); ctx.globalAlpha = 1;
+    };
+    draw();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(draw);
+    observer?.observe(canvas);
+    return () => observer?.disconnect();
+  }, [analysis]);
+  const cursorRatio = duration ? Math.min(1, Math.max(0, currentTime / duration)) : 0;
+  return <div className="overview-canvas-stack" role="slider" tabIndex={0} aria-label="Waveform and spectrogram overview. Tap to seek." aria-valuemin={0} aria-valuemax={Math.round(duration)} aria-valuenow={Math.round(currentTime)} onKeyDown={(event) => {
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      onSeek(currentTime + (event.key === "ArrowLeft" ? -5 : 5));
     }
-    const cursor = duration ? currentTime / duration * w : 0;
-    ctx.fillStyle = "#ffc85a"; ctx.fillRect(cursor - 1, 0, 2, h);
-    ctx.beginPath(); ctx.moveTo(cursor - 6, 0); ctx.lineTo(cursor + 6, 0); ctx.lineTo(cursor, 8); ctx.fill();
-  }, [analysis, currentTime, duration]);
-  return <canvas ref={canvasRef} className="overview-canvas" aria-label="Waveform and spectrogram overview. Tap to seek." onPointerDown={(e) => { const r = e.currentTarget.getBoundingClientRect(); onSeek((e.clientX - r.left) / r.width * duration); }}/>
+  }} onPointerDown={(event) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    onSeek((event.clientX - rect.left) / rect.width * duration);
+  }}>
+    <canvas ref={canvasRef} className="overview-canvas"/>
+    {analysis ? <i className="overview-playhead" style={{ left: `${cursorRatio * 100}%` }}/> : null}
+  </div>;
 }
 
 export function WindowWaveform({ analysis, currentTime, duration, windowSeconds, onSeek }: { analysis: AnalysisData | null; currentTime: number; duration: number; windowSeconds: number; onSeek: (v: number) => void }) {
@@ -54,7 +70,7 @@ export function WindowWaveform({ analysis, currentTime, duration, windowSeconds,
 
     for (let x = 0; x < Math.ceil(w); x++) {
       const time = range.start + x / w * range.span;
-      const col = Math.min(analysis.columns - 1, Math.max(0, Math.floor(time / analysis.duration * analysis.columns)));
+      const col = analysisFrameAtTime(analysis, time);
       const voiceLikelihood = Math.max(analysis.speech[col], analysis.whisper[col] * 0.9);
       if (voiceLikelihood > 0.5) {
         ctx.fillStyle = `rgba(111,241,207,${0.04 + voiceLikelihood * 0.11})`;

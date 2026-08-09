@@ -7,8 +7,10 @@ import { Overview, WindowWaveform } from "./Overview";
 import { KnobSlider } from "./KnobSlider";
 import { VoiceProfilePanel } from "./VoiceProfilePanel";
 import { useAudioEngine } from "@/hooks/useAudioEngine";
+import { analysisFrameAtTime } from "@/lib/analysisClock";
 import { db, formatTime } from "@/lib/format";
 import { getVisibleTimeRange } from "@/lib/timeWindow";
+import { forgetRecording, persistRecording, recoverRecording, recordingId, savePlaybackSnapshot } from "@/lib/audioSession";
 import type { EnhanceSettings, FocusSettings, TranscriptLanguage, TranscriptWord } from "@/types/audio";
 
 export function VoiceScope() {
@@ -29,17 +31,30 @@ export function VoiceScope() {
   const [transcriptWords, setTranscriptWords] = useState<TranscriptWord[]>([]);
   const [noiseHint, setNoiseHint] = useState("Use a quiet 5-second region");
   const [noiseConfidence, setNoiseConfidence] = useState(0);
+  const [recoveryMessage, setRecoveryMessage] = useState("");
+  const [recoveryAvailable, setRecoveryAvailable] = useState(false);
+  const [recoveryWarning, setRecoveryWarning] = useState(false);
   const transcriptWorkerRef = useRef<Worker | null>(null);
-  const transcriptionAudioCacheRef = useRef<Float32Array | null>(null);
   const activeTranscriptLanguageRef = useRef<TranscriptLanguage>("auto");
+  const transcriptionRequestRef = useRef(0);
+  const activeRecordingIdRef = useRef("");
+  const restoreStartedRef = useRef(false);
   const engine = useAudioEngine(settings, focus);
+  const loadAudioFile = engine.loadFile;
+  const getAudioCurrentTime = engine.getCurrentTime;
+  const restoreRate = engine.setRate;
+  const restoreVolume = engine.setVolume;
+  const restoreLoop = engine.setLoop;
   const setSetting = <K extends keyof EnhanceSettings>(key: K, value: EnhanceSettings[K]) => setSettings((old) => ({ ...old, [key]: value }));
   const ready = Boolean(engine.fileName);
   const detectionThreshold = 0.68 - focus.speechSensitivity * 0.36;
   const liveVoiceLikelihood = Math.min(1, Math.max(engine.metrics.speech, engine.metrics.whisper * (0.78 + focus.speechSensitivity * 0.3)));
   const whisperPresent = engine.metrics.whisper >= detectionThreshold && engine.metrics.whisper > engine.metrics.speech * 0.88;
 
-  useEffect(() => () => transcriptWorkerRef.current?.terminate(), []);
+  useEffect(() => () => {
+    transcriptionRequestRef.current++;
+    transcriptWorkerRef.current?.terminate();
+  }, []);
 
   const applySpeechFocus = () => {
     setSettings({ enabled: true, strength: 0.84, clarity: 0.82, suppression: 0.76, gain: 0.64 });
@@ -60,7 +75,7 @@ export function VoiceScope() {
     const candidates: number[] = [];
     for (let frame = start; frame < end; frame++) {
       const time = (frame + 0.5) / data.noiseFrames * data.duration;
-      const column = Math.min(data.columns - 1, Math.floor(time / data.duration * data.columns));
+      const column = analysisFrameAtTime(data, time);
       const voiced = data.pitch[column] > 0 && data.speech[column] > 0.45;
       const strongWhisper = data.whisper[column] >= 0.62;
       if (!voiced && !strongWhisper && data.noiseRms[frame] > 0) candidates.push(data.noiseRms[frame]);
@@ -97,15 +112,14 @@ export function VoiceScope() {
   };
 
   const createTranscriptWorker = () => {
-    const worker = new Worker(new URL("../workers/transcribe.worker.ts", import.meta.url));
+    const worker = new Worker(new URL("../workers/transcribe.worker.ts", import.meta.url), { type: "module" });
     transcriptWorkerRef.current = worker;
-    worker.onmessage = ({ data }: MessageEvent<{ type: string; status?: string; progress?: number; words?: TranscriptWord[]; error?: string; audio?: Float32Array }>) => {
+    worker.onmessage = ({ data }: MessageEvent<{ type: string; status?: string; progress?: number; words?: TranscriptWord[]; error?: string }>) => {
       if (data.type === "status") {
         setTranscriptStatus(data.status ?? "Working locally…");
         setTranscriptProgress(data.progress ?? 0);
       }
       if (data.type === "complete") {
-        transcriptionAudioCacheRef.current = data.audio ?? null;
         setTranscriptWords(data.words ?? []);
         setTranscribedLanguage(activeTranscriptLanguageRef.current);
         setTranscriptStatus(data.words?.length ? `Complete · ${data.words.length} timed words` : "Complete · no clear speech detected");
@@ -115,7 +129,6 @@ export function VoiceScope() {
         transcriptWorkerRef.current = null;
       }
       if (data.type === "error") {
-        transcriptionAudioCacheRef.current = data.audio ?? null;
         setTranscriptStatus(`Unavailable: ${data.error ?? "model could not load"}`);
         setTranscriptProgress(0);
         setTranscriptBusy(false);
@@ -133,7 +146,7 @@ export function VoiceScope() {
     return worker;
   };
 
-  const startTranscription = (language = transcriptLanguage) => {
+  const startTranscription = async (language = transcriptLanguage) => {
     if (!ready) return;
     if (transcriptBusy) return;
     if (transcribedLanguage === language) {
@@ -145,24 +158,36 @@ export function VoiceScope() {
     setTranscriptBusy(true);
     setTranscriptWords([]);
     setTranscribedLanguage(null);
-    setTranscriptStatus("Preparing local Whisper…");
+    setTranscriptStatus("Preparing a temporary 16 kHz speech copy…");
     setTranscriptProgress(0.01);
     activeTranscriptLanguageRef.current = language;
-    const audio = transcriptionAudioCacheRef.current ?? engine.takeTranscriptionAudio();
+    const request = ++transcriptionRequestRef.current;
+    const audio = await engine.prepareTranscriptionAudio();
+    if (request !== transcriptionRequestRef.current) return;
     if (!audio) {
-      setTranscriptStatus("Reload the recording to retry transcription.");
+      setTranscriptStatus("The recording changed before transcription could start. Try again.");
       setTranscriptBusy(false);
       return;
     }
-    transcriptionAudioCacheRef.current = null;
+    setTranscriptStatus("Preparing local Whisper…");
     const worker = createTranscriptWorker();
     worker.postMessage({ audio, language }, [audio.buffer]);
   };
 
-  const loadRecording = (file: File) => {
+  const stopTranscription = () => {
+    transcriptionRequestRef.current++;
     transcriptWorkerRef.current?.terminate();
     transcriptWorkerRef.current = null;
-    transcriptionAudioCacheRef.current = null;
+    setTranscriptionEnabled(false);
+    setTranscriptBusy(false);
+    setTranscriptProgress(0);
+    setTranscriptStatus("Off");
+  };
+
+  const loadRecording = async (file: File) => {
+    transcriptionRequestRef.current++;
+    transcriptWorkerRef.current?.terminate();
+    transcriptWorkerRef.current = null;
     setTranscriptionEnabled(false);
     setTranscriptBusy(false);
     setTranscriptStatus("Off");
@@ -172,7 +197,97 @@ export function VoiceScope() {
     setFocus((old) => ({ ...old, noiseFloor: null, noiseProfileEnabled: false }));
     setNoiseConfidence(0);
     setNoiseHint("Use a quiet 5-second region");
-    void engine.loadFile(file);
+    setRecoveryMessage("Preparing a private recovery copy on this device…");
+    setRecoveryWarning(false);
+    const loaded = await engine.loadFile(file);
+    if (!loaded) {
+      setRecoveryMessage("");
+      return;
+    }
+    try {
+      const id = await persistRecording(file);
+      activeRecordingIdRef.current = id;
+      setRecoveryAvailable(true);
+      setRecoveryMessage("Reload protection active · recording retained locally for 24 hours");
+    } catch {
+      activeRecordingIdRef.current = recordingId(file);
+      setRecoveryAvailable(false);
+      setRecoveryWarning(true);
+      setRecoveryMessage("Recovery storage is unavailable · keep the original recording nearby");
+    }
+  };
+
+  useEffect(() => {
+    if (restoreStartedRef.current) return;
+    restoreStartedRef.current = true;
+    void (async () => {
+      try {
+        const recovered = await recoverRecording();
+        if (!recovered) return;
+        activeRecordingIdRef.current = recovered.recordingId;
+        const snapshot = recovered.snapshot;
+        if (snapshot) {
+          setRateValue(snapshot.rate);
+          setVolumeValue(snapshot.volume);
+          setLoopValue(snapshot.loop);
+        }
+        setRecoveryMessage("Restoring the previous private session…");
+        const loaded = await loadAudioFile(recovered.file, snapshot?.currentTime ?? 0);
+        if (!loaded) {
+          setRecoveryWarning(true);
+          setRecoveryMessage("The saved recording could not be restored · load the original file");
+          return;
+        }
+        if (snapshot) {
+          restoreRate(snapshot.rate);
+          restoreVolume(snapshot.volume);
+          restoreLoop(snapshot.loop);
+        }
+        setRecoveryAvailable(true);
+        setRecoveryMessage(snapshot?.currentTime ? `Session restored at ${formatTime(snapshot.currentTime)}` : "Previous recording restored locally");
+      } catch {
+        setRecoveryWarning(true);
+        setRecoveryMessage("Recovery storage is unavailable · load the original recording");
+      }
+    })();
+  }, [loadAudioFile, restoreLoop, restoreRate, restoreVolume]);
+
+  useEffect(() => {
+    if (!ready) return;
+    const save = () => {
+      const id = activeRecordingIdRef.current;
+      if (!id) return;
+      savePlaybackSnapshot({
+        recordingId: id,
+        currentTime: getAudioCurrentTime(),
+        rate,
+        volume,
+        loop,
+        savedAt: Date.now(),
+      });
+    };
+    const interval = window.setInterval(save, 3000);
+    const onVisibilityChange = () => { if (document.visibilityState === "hidden") save(); };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("pagehide", save);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("pagehide", save);
+    };
+  }, [getAudioCurrentTime, loop, rate, ready, volume]);
+
+  const forgetRecovery = async () => {
+    try {
+      await forgetRecording();
+      activeRecordingIdRef.current = "";
+      setRecoveryAvailable(false);
+      setRecoveryWarning(true);
+      setRecoveryMessage("Recovery copy removed · a reload will require the original recording");
+    } catch {
+      setRecoveryWarning(true);
+      setRecoveryMessage("The browser could not remove its recovery copy");
+    }
   };
 
   return <main>
@@ -180,7 +295,7 @@ export function VoiceScope() {
     <header className="topbar">
       <div className="brand"><div className="brand-mark"><AudioLines/></div><div><h1>VoiceScope <em>3D</em></h1><p>LOCAL AUDIO INTELLIGENCE</p></div></div>
       <div className="privacy"><LockKeyhole/><span><b>Private session</b>Processing stays on this device</span></div>
-      <input ref={inputRef} type="file" accept="audio/*,.m4a,.aac,.mp3,.wav" hidden onChange={(e) => e.target.files?.[0] && loadRecording(e.target.files[0])}/>
+      <input ref={inputRef} type="file" accept="audio/*,.m4a,.aac,.mp3,.wav" hidden onChange={(event) => { const file = event.target.files?.[0]; if (file) void loadRecording(file); }}/>
       <button className="upload-button" onClick={() => inputRef.current?.click()}><Upload/> {ready ? "Replace audio" : "Load audio"}</button>
     </header>
 
@@ -190,6 +305,7 @@ export function VoiceScope() {
           <div><span className="eyebrow"><Waves/> SPECTRAL TERRAIN</span><h2>{engine.fileName || "No recording loaded"}</h2></div>
           <div className="analysis-state"><i className={engine.analysis ? "live" : ""}/>{engine.analysis ? "ANALYSIS READY" : engine.progress ? `ANALYZING ${Math.round(engine.progress * 100)}%` : "AWAITING SIGNAL"}</div>
         </div>
+        {recoveryMessage ? <div className={recoveryWarning ? "session-recovery warning" : "session-recovery"}><span><LockKeyhole/><b>{recoveryMessage}</b></span>{recoveryAvailable ? <button onClick={() => void forgetRecovery()}>Forget recovery copy</button> : null}</div> : null}
         {engine.error && <div className="error"><Info/>{engine.error}</div>}
         <Spectrogram3D analysis={engine.analysis} currentTime={engine.currentTime} windowSeconds={windowSeconds} depth={depth}/>
         <div className="visual-controls">
@@ -236,14 +352,14 @@ export function VoiceScope() {
             {focus.noiseFloor !== null ? <button className="noise-reset" onClick={resetNoiseProfile}><RotateCcw/><span><b>Reset noise profile</b><small>Forget the learned threshold</small></span></button> : null}
             <label className="feature-toggle"><span><b>Voice-only playback</b><small>Skips detected non-speech</small></span><button role="switch" aria-checked={focus.voiceOnly} className={focus.voiceOnly ? "toggle on" : "toggle"} onClick={() => setFocus((old) => ({ ...old, voiceOnly: !old.voiceOnly }))} disabled={!ready}><i/></button></label>
           </div>
-          <label className="neural-slider"><span><BrainCircuit/><b>Local neural denoising</b><output>{Math.round(focus.neuralDenoise * 100)}%</output></span><input type="range" min="0" max="1" step=".05" value={focus.neuralDenoise} onChange={(e) => setFocus((old) => ({ ...old, neuralDenoise: Number(e.target.value) }))}/><small>{engine.neuralStatus === "loading" ? "Loading RNNoise locally…" : engine.neuralStatus === "error" ? `RNNoise unavailable: ${engine.neuralDetail}` : engine.neuralStatus === "ready" ? "RNNoise active · audio stays on device" : focus.neuralDenoise ? "Ready to load when playback starts" : "Off"}</small></label>
+          <label className="neural-slider"><span><BrainCircuit/><b>Local neural denoising</b><output>{Math.round(focus.neuralDenoise * 100)}%</output></span><input type="range" min="0" max="1" step=".05" value={focus.neuralDenoise} onChange={(e) => setFocus((old) => ({ ...old, neuralDenoise: Number(e.target.value) }))}/><small>{focus.neuralDenoise === 0 ? "Off" : engine.neuralStatus === "loading" ? "Loading RNNoise locally…" : engine.neuralStatus === "error" ? `RNNoise unavailable: ${engine.neuralDetail}` : engine.neuralStatus === "ready" ? "RNNoise active · audio stays on device" : "Ready to load when playback starts"}</small></label>
           <label className="neural-slider sensitivity-slider"><span><Activity/><b>Speech / whisper sensitivity</b><output>{Math.round(focus.speechSensitivity * 100)}%</output></span><input type="range" min="0" max="1" step=".05" value={focus.speechSensitivity} onChange={(e) => setFocus((old) => ({ ...old, speechSensitivity: Number(e.target.value) }))}/><small>Higher values preserve fainter candidates but may include more background sound.</small></label>
         </div>
 
         <div className="inspector-title transcript-title"><Captions/><span>LOCAL TRANSCRIPT</span></div>
         <div className="transcript-card">
-          <label className="transcript-language"><Languages/><span><b>Spoken language</b><small>Choose a language for muffled audio</small></span><select value={transcriptLanguage} disabled={transcriptBusy} onChange={(event) => { const language = event.target.value as TranscriptLanguage; setTranscriptLanguage(language); if (transcriptionEnabled) startTranscription(language); }}><option value="auto">Auto detect</option><option value="en">English</option><option value="hi">हिन्दी · Hindi</option><option value="mr">मराठी · Marathi</option></select></label>
-          <div className="feature-toggle"><span><b>Whisper transcription</b><small>English · Hindi · Marathi · word timestamps</small></span><button role="switch" aria-checked={transcriptionEnabled} className={transcriptionEnabled ? "toggle on" : "toggle"} onClick={() => transcriptionEnabled ? setTranscriptionEnabled(false) : startTranscription()} disabled={!ready}><i/></button></div>
+          <label className="transcript-language"><Languages/><span><b>Spoken language</b><small>Choose a language for muffled audio</small></span><select value={transcriptLanguage} disabled={transcriptBusy} onChange={(event) => { const language = event.target.value as TranscriptLanguage; setTranscriptLanguage(language); if (transcriptionEnabled) void startTranscription(language); }}><option value="auto">Auto detect</option><option value="en">English</option><option value="hi">हिन्दी · Hindi</option><option value="mr">मराठी · Marathi</option></select></label>
+          <div className="feature-toggle"><span><b>Whisper transcription</b><small>English · Hindi · Marathi · word timestamps</small></span><button role="switch" aria-checked={transcriptionEnabled} className={transcriptionEnabled ? "toggle on" : "toggle"} onClick={() => { if (transcriptionEnabled) stopTranscription(); else void startTranscription(); }} disabled={!ready}><i/></button></div>
           {transcriptionEnabled && <>
             <div className="transcript-progress"><i style={{ width: `${transcriptProgress * 100}%` }}/></div>
             <p className="transcript-status">{transcriptStatus}</p>

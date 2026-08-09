@@ -1,15 +1,18 @@
 /// <reference lib="webworker" />
 
+import { analysisFrame } from "../lib/analysisClock";
+
 type Request = { samples: Float32Array; sampleRate: number; duration: number };
 
 const ctx: DedicatedWorkerGlobalScope = self as unknown as DedicatedWorkerGlobalScope;
 
 ctx.onmessage = ({ data }: MessageEvent<Request>) => {
   const { samples, sampleRate, duration } = data;
-  const columns = Math.min(1800, Math.max(320, Math.ceil(duration * 1.5)));
+  const columns = Math.min(12000, Math.max(600, Math.ceil(duration * 4)));
   const bands = 72;
   const fftSize = 1024;
   const waveform = new Float32Array(columns * 2);
+  const overviewWaveform = new Float32Array(columns * 2);
   const spectral = new Uint8Array(columns * bands);
   const rms = new Float32Array(columns);
   const peak = new Float32Array(columns);
@@ -25,8 +28,18 @@ ctx.onmessage = ({ data }: MessageEvent<Request>) => {
   const dominant = new Float32Array(columns);
   const re = new Float32Array(fftSize);
   const im = new Float32Array(fftSize);
+  const fftWindow = new Float32Array(fftSize);
+  const twiddleReal = new Float32Array(fftSize / 2);
+  const twiddleImaginary = new Float32Array(fftSize / 2);
   const pitchFrame = new Float32Array(480);
   const pitchScores = new Float32Array(110);
+  const clock = { duration, columns, sampleRate, totalSamples: samples.length };
+  for (let index = 0; index < fftSize; index++) fftWindow[index] = 0.5 - 0.5 * Math.cos((2 * Math.PI * index) / (fftSize - 1));
+  for (let index = 0; index < fftSize / 2; index++) {
+    const angle = -2 * Math.PI * index / fftSize;
+    twiddleReal[index] = Math.cos(angle);
+    twiddleImaginary[index] = Math.sin(angle);
+  }
 
   for (let frame = 0; frame < noiseFrames; frame++) {
     const start = Math.floor(frame / noiseFrames * samples.length);
@@ -42,29 +55,34 @@ ctx.onmessage = ({ data }: MessageEvent<Request>) => {
   }
 
   for (let c = 0; c < columns; c++) {
-    const start = Math.floor((c / columns) * samples.length);
-    const end = Math.max(start + 1, Math.floor(((c + 1) / columns) * samples.length));
-    let lo = 1, hi = -1, sumSq = 0, zc = 0, previous = samples[start] || 0;
-    const stride = Math.max(1, Math.floor((end - start) / 1024));
+    const frame = analysisFrame(clock, c);
+    let overviewLow = 1, overviewHigh = -1;
+    const overviewStride = Math.max(1, Math.floor((frame.endSample - frame.startSample) / 1024));
+    for (let sampleIndex = frame.startSample; sampleIndex < frame.endSample; sampleIndex += overviewStride) {
+      const value = samples[sampleIndex] || 0;
+      overviewLow = Math.min(overviewLow, value);
+      overviewHigh = Math.max(overviewHigh, value);
+    }
+    overviewWaveform[c * 2] = overviewLow;
+    overviewWaveform[c * 2 + 1] = overviewHigh;
+
+    let lo = 1, hi = -1, sumSq = 0, zc = 0;
+    let previous = samples[frame.centerSample - fftSize / 2] || 0;
     let count = 0;
-    for (let i = start; i < end; i += stride) {
-      const value = samples[i] || 0;
-      lo = Math.min(lo, value); hi = Math.max(hi, value);
-      sumSq += value * value; count++;
-      if ((value >= 0) !== (previous >= 0)) zc++;
-      previous = value;
+    for (let i = 0; i < fftSize; i++) {
+      const sample = samples[frame.centerSample - fftSize / 2 + i] || 0;
+      lo = Math.min(lo, sample); hi = Math.max(hi, sample);
+      sumSq += sample * sample; count++;
+      if ((sample >= 0) !== (previous >= 0)) zc++;
+      previous = sample;
+      re[i] = sample * fftWindow[i];
+      im[i] = 0;
     }
     const level = Math.sqrt(sumSq / Math.max(1, count));
     waveform[c * 2] = lo; waveform[c * 2 + 1] = hi;
     rms[c] = level; peak[c] = Math.max(Math.abs(lo), Math.abs(hi));
 
-    const center = Math.floor(((c + 0.5) / columns) * samples.length);
-    for (let i = 0; i < fftSize; i++) {
-      const sample = samples[center - fftSize / 2 + i] || 0;
-      re[i] = sample * (0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (fftSize - 1)));
-      im[i] = 0;
-    }
-    fft(re, im);
+    fft(re, im, twiddleReal, twiddleImaginary);
     let best = 0, bestBin = 0, voiceEnergy = 0, highSpeechEnergy = 0, lowEnergy = 0, totalEnergy = 0;
     for (let b = 0; b < bands; b++) {
       const lowHz = 45 * Math.pow(20000 / 45, b / bands);
@@ -94,7 +112,7 @@ ctx.onmessage = ({ data }: MessageEvent<Request>) => {
       faintLevelScore * 0.22 + voiceRatio * 0.32 + highSpeechRatio * 0.58 + breathiness * 0.16 - lowRatio * 0.28 - 0.22,
     ));
     if (speech[c] > 0.38 && level > 0.00008) {
-      const estimate = estimatePitch(samples, center, sampleRate, pitchFrame, pitchScores);
+      const estimate = estimatePitch(samples, frame.centerSample, sampleRate, pitchFrame, pitchScores);
       rawPitch[c] = estimate.hz;
       periodicity[c] = estimate.periodicity;
     }
@@ -102,34 +120,19 @@ ctx.onmessage = ({ data }: MessageEvent<Request>) => {
     if (c % 40 === 0) ctx.postMessage({ type: "progress", progress: c / columns });
   }
 
-  for (let c = 1; c < columns - 1; c++) {
-    whisper[c] = whisper[c - 1] * 0.2 + whisper[c] * 0.6 + whisper[c + 1] * 0.2;
-  }
-
   for (let c = 0; c < columns; c++) {
-    if (speech[c] < 0.42) continue;
-    const nearby: number[] = [];
-    let periodicitySum = 0;
-    for (let i = Math.max(0, c - 2); i <= Math.min(columns - 1, c + 2); i++) {
-      if (rawPitch[i] > 0 && periodicity[i] >= 0.48) {
-        nearby.push(rawPitch[i]);
-        periodicitySum += periodicity[i];
-      }
-    }
-    if (!nearby.length) continue;
-    nearby.sort((a, b) => a - b);
-    const medianPitch = nearby[Math.floor(nearby.length / 2)];
-    const semitonesFromCenter = 12 * Math.log2(medianPitch / 170);
+    if (speech[c] < 0.42 || rawPitch[c] <= 0 || periodicity[c] < 0.48) continue;
+    const semitonesFromCenter = 12 * Math.log2(rawPitch[c] / 170);
     const separation = Math.min(1, Math.max(0, (Math.abs(semitonesFromCenter) - 1.2) / 4.8));
-    const clarity = Math.min(1, Math.max(0, (periodicitySum / nearby.length - 0.46) / 0.44));
+    const clarity = Math.min(1, Math.max(0, (periodicity[c] - 0.46) / 0.44));
     const whisperPenalty = whisper[c] > speech[c] ? 0.45 : 1;
-    pitch[c] = medianPitch;
+    pitch[c] = rawPitch[c];
     profile[c] = Math.min(1, Math.max(-1, semitonesFromCenter / 6));
     profileConfidence[c] = Math.min(1, separation * clarity * speech[c] * whisperPenalty);
   }
 
-  ctx.postMessage({ type: "complete", analysis: { duration, columns, bands, waveform, spectral, rms, peak, speech, whisper, pitch, profile, profileConfidence, noiseFrames, noiseRms, dominant } },
-    [waveform.buffer, spectral.buffer, rms.buffer, peak.buffer, speech.buffer, whisper.buffer, pitch.buffer, profile.buffer, profileConfidence.buffer, noiseRms.buffer, dominant.buffer]);
+  ctx.postMessage({ type: "complete", analysis: { duration, columns, bands, sampleRate, totalSamples: samples.length, waveform, overviewWaveform, spectral, rms, peak, speech, whisper, pitch, profile, profileConfidence, noiseFrames, noiseRms, dominant } },
+    [waveform.buffer, overviewWaveform.buffer, spectral.buffer, rms.buffer, peak.buffer, speech.buffer, whisper.buffer, pitch.buffer, profile.buffer, profileConfidence.buffer, noiseRms.buffer, dominant.buffer]);
 };
 
 function estimatePitch(samples: Float32Array, center: number, sampleRate: number, frame: Float32Array, scores: Float32Array) {
@@ -186,7 +189,7 @@ function estimatePitch(samples: Float32Array, center: number, sampleRate: number
   return { hz: targetRate / refinedLag, periodicity: middle };
 }
 
-function fft(re: Float32Array, im: Float32Array) {
+function fft(re: Float32Array, im: Float32Array, twiddleReal: Float32Array, twiddleImaginary: Float32Array) {
   const n = re.length;
   for (let i = 1, j = 0; i < n; i++) {
     let bit = n >> 1;
@@ -195,10 +198,10 @@ function fft(re: Float32Array, im: Float32Array) {
     if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
   }
   for (let len = 2; len <= n; len <<= 1) {
-    const angle = -2 * Math.PI / len;
     for (let i = 0; i < n; i += len) {
       for (let j = 0; j < len / 2; j++) {
-        const cos = Math.cos(angle * j), sin = Math.sin(angle * j);
+        const twiddle = j * n / len;
+        const cos = twiddleReal[twiddle], sin = twiddleImaginary[twiddle];
         const p = i + j, q = p + len / 2;
         const tr = re[q] * cos - im[q] * sin, ti = re[q] * sin + im[q] * cos;
         re[q] = re[p] - tr; im[q] = im[p] - ti; re[p] += tr; im[p] += ti;
