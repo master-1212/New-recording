@@ -1,5 +1,5 @@
-onlyBuiltDependencies:
-  - unrs-resolver
+allowBuilds:
+  unrs-resolver: true
 minimumReleaseAge: 4320
 minimumReleaseAgeIgnoreMissingTime: false
 blockExoticSubdeps: true
