@@ -1,4 +1,10 @@
-allowBuilds:
-  unrs-resolver: set this to true or false
 onlyBuiltDependencies:
   - unrs-resolver
+minimumReleaseAge: 4320
+minimumReleaseAgeIgnoreMissingTime: false
+blockExoticSubdeps: true
+trustLockfile: false
+strictDepBuilds: true
+engineStrict: true
+saveExact: true
+strictPeerDependencies: true

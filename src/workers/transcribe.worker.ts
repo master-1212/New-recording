@@ -10,7 +10,11 @@ type PipelineResult = {
 type Transcriber = (audio: Float32Array, options: Record<string, unknown>) => Promise<PipelineResult>;
 
 type TransformersModule = {
-  env: { allowLocalModels: boolean; useBrowserCache: boolean };
+  env: {
+    allowLocalModels: boolean;
+    useBrowserCache: boolean;
+    backends: { onnx: { wasm: { wasmPaths: string; numThreads: number } } };
+  };
   pipeline: (
     task: string,
     model: string,
@@ -39,12 +43,17 @@ self.onmessage = async ({ data }: MessageEvent<{ audio?: Float32Array; language:
       const transformers = (await import(/* webpackIgnore: true */ moduleUrl)) as TransformersModule;
       transformers.env.allowLocalModels = false;
       transformers.env.useBrowserCache = true;
+      transformers.env.backends.onnx.wasm.wasmPaths = "/runtime/";
+      // One inference thread avoids SharedArrayBuffer requirements and is more
+      // stable under iPad Safari's memory pressure than a threaded WASM pool.
+      transformers.env.backends.onnx.wasm.numThreads = 1;
       transcriber = await transformers.pipeline(
         "automatic-speech-recognition",
         "onnx-community/whisper-tiny_timestamped",
         {
           dtype: "q8",
           device: "wasm",
+          revision: "517244293732ee2d58139af5814231b7e6830a0d",
           progress_callback: (item: { progress?: number; status?: string }) => {
             if (typeof item.progress === "number") {
               self.postMessage({

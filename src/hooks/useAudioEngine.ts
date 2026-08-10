@@ -2,12 +2,42 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { analysisFrameAtTime } from "@/lib/analysisClock";
+import { computeAdaptiveFrame, computeDspParameters, voiceLikelihood } from "@/lib/dsp";
 import type { AnalysisData, EnhanceSettings, FocusSettings, LiveMetrics } from "@/types/audio";
 
-const emptyMetrics: LiveMetrics = { speech: 0, whisper: 0, pitch: 0, profile: 0, profileConfidence: 0, peak: 0, rms: 0, dominant: 0 };
+const emptyMetrics: LiveMetrics = { speech: 0, whisper: 0, noise: 0, clarity: 0, pitch: 0, profile: 0, profileConfidence: 0, peak: 0, rms: 0, dominant: 0 };
 
-function voiceLikelihood(data: AnalysisData, index: number, sensitivity: number) {
-  return Math.min(1, Math.max(data.speech[index], data.whisper[index] * (0.78 + sensitivity * 0.3)));
+type FilterNodes = {
+  highpass: BiquadFilterNode;
+  low: BiquadFilterNode;
+  hum50: BiquadFilterNode;
+  hum100: BiquadFilterNode;
+  mud: BiquadFilterNode;
+  intelligibility: BiquadFilterNode;
+  presence: BiquadFilterNode;
+  articulation: BiquadFilterNode;
+  hiss: BiquadFilterNode;
+  lowpass: BiquadFilterNode;
+  comp: DynamicsCompressorNode;
+  gain: GainNode;
+};
+
+function applyFilterSettings(context: AudioContext, nodes: FilterNodes, settings: EnhanceSettings, focus: FocusSettings) {
+  const now = context.currentTime;
+  const parameters = computeDspParameters(settings, focus);
+  nodes.highpass.frequency.setTargetAtTime(parameters.highpassHz, now, 0.025);
+  nodes.low.gain.setTargetAtTime(parameters.lowShelfDb, now, 0.025);
+  nodes.hum50.gain.setTargetAtTime(parameters.hum50Db, now, 0.025);
+  nodes.hum100.gain.setTargetAtTime(parameters.hum100Db, now, 0.025);
+  nodes.mud.gain.setTargetAtTime(parameters.mudDb, now, 0.025);
+  nodes.intelligibility.gain.setTargetAtTime(parameters.intelligibilityDb, now, 0.025);
+  nodes.presence.gain.setTargetAtTime(parameters.presenceDb, now, 0.025);
+  nodes.articulation.gain.setTargetAtTime(parameters.articulationDb, now, 0.025);
+  nodes.hiss.gain.setTargetAtTime(parameters.hissShelfDb, now, 0.025);
+  nodes.lowpass.frequency.setTargetAtTime(parameters.lowpassHz, now, 0.025);
+  nodes.comp.threshold.setTargetAtTime(parameters.compressorThresholdDb, now, 0.025);
+  nodes.comp.ratio.setTargetAtTime(parameters.compressorRatio, now, 0.025);
+  nodes.gain.gain.setTargetAtTime(Math.pow(10, parameters.makeupDb / 20), now, 0.025);
 }
 
 type RnnoiseModule = {
@@ -25,8 +55,10 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
   const neuralDryRef = useRef<GainNode | null>(null);
   const neuralWetRef = useRef<GainNode | null>(null);
   const rnnoiseRef = useRef<AudioWorkletNode | null>(null);
+  const rnnoiseConnectedRef = useRef(false);
   const rnnoisePromiseRef = useRef<Promise<void> | null>(null);
   const adaptiveGateRef = useRef<GainNode | null>(null);
+  const adaptiveVoiceGainRef = useRef<GainNode | null>(null);
   const fileRef = useRef<File | null>(null);
   const analysisWorkerRef = useRef<Worker | null>(null);
   const pendingSeekRef = useRef(0);
@@ -38,7 +70,7 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
   const noiseReductionRef = useRef(0);
   const lastVoiceSkipRef = useRef(-1);
   const volumeValueRef = useRef(0.9);
-  const filtersRef = useRef<{ highpass: BiquadFilterNode; low: BiquadFilterNode; presence: BiquadFilterNode; articulation: BiquadFilterNode; lowpass: BiquadFilterNode; comp: DynamicsCompressorNode; gain: GainNode } | null>(null);
+  const filtersRef = useRef<FilterNodes | null>(null);
   const urlRef = useRef<string | null>(null);
   const frameRef = useRef(0);
   const lastUiFrameRef = useRef(0);
@@ -71,6 +103,8 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
     setMetrics({
       speech: data.speech[index],
       whisper: data.whisper[index],
+      noise: data.noise[index],
+      clarity: data.clarity[index],
       pitch: data.pitch[index],
       profile: data.profile[index],
       profileConfidence: data.profileConfidence[index],
@@ -95,30 +129,34 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
         const activeFocus = focusRef.current;
         if (data?.duration && !audio.paused) {
           const index = analysisFrameAtTime(data, time);
-          const likelihood = voiceLikelihood(data, index, activeFocus.speechSensitivity);
-          const detectionThreshold = 0.68 - activeFocus.speechSensitivity * 0.36;
+          const likelihood = voiceLikelihood(data.speech[index], data.whisper[index], activeFocus.speechSensitivity);
+          const threshold = 0.68 - activeFocus.speechSensitivity * 0.36;
           const gate = adaptiveGateRef.current;
+          const voiceGain = adaptiveVoiceGainRef.current;
           const context = contextRef.current;
-          if (gate && context) {
-            const learnedFloor = activeFocus.noiseFloor;
-            const profileActive = activeFocus.noiseProfileEnabled && learnedFloor !== null;
+          if (gate && voiceGain && context) {
             const noiseIndex = Math.min(data.noiseFrames - 1, Math.max(0, Math.floor(time / data.duration * data.noiseFrames)));
             const currentRms = data.noiseRms[noiseIndex] || data.rms[index];
-            const belowNoise = profileActive && currentRms < learnedFloor * 1.65;
-            const noiseAmount = belowNoise ? Math.min(1, Math.max(0, 1 - likelihood / Math.max(0.1, detectionThreshold))) : 0;
-            const whisperProtection = activeFocus.whisperRecovery ? 0.55 : 1;
-            const reductionDb = noiseAmount * (8 + settingsRef.current.suppression * 18) * whisperProtection;
-            const attenuation = Math.pow(10, -reductionDb / 20);
-            gate.gain.setTargetAtTime(attenuation, context.currentTime, attenuation < 1 ? 0.035 : 0.018);
-            publishNoiseReduction(settingsRef.current.enabled ? reductionDb : 0);
+            const adaptive = computeAdaptiveFrame({
+              speech: data.speech[index],
+              whisper: data.whisper[index],
+              noise: data.noise[index],
+              clarity: data.clarity[index],
+              rms: currentRms,
+            }, settingsRef.current, activeFocus);
+            gate.gain.setTargetAtTime(adaptive.gateGain, context.currentTime, adaptive.gateGain < 1 ? 0.045 : 0.02);
+            voiceGain.gain.setTargetAtTime(adaptive.voiceGain, context.currentTime, adaptive.voiceGain > 1 ? 0.055 : 0.025);
+            publishNoiseReduction(adaptive.reductionDb);
           }
-          if (activeFocus.voiceOnly && likelihood < detectionThreshold - 0.06 && time - lastVoiceSkipRef.current > 0.25) {
+          if (activeFocus.voiceOnly && likelihood < threshold - 0.06 && time - lastVoiceSkipRef.current > 0.25) {
             const confirmation = Math.max(2, Math.ceil(data.columns / data.duration * 0.35));
             let quiet = true;
-            for (let i = index; i < Math.min(data.columns, index + confirmation); i++) quiet &&= voiceLikelihood(data, i, activeFocus.speechSensitivity) < detectionThreshold;
+            for (let i = index; i < Math.min(data.columns, index + confirmation); i++) {
+              quiet &&= voiceLikelihood(data.speech[i], data.whisper[i], activeFocus.speechSensitivity) < threshold;
+            }
             if (quiet) {
               let next = index + confirmation;
-              while (next < data.columns && voiceLikelihood(data, next, activeFocus.speechSensitivity) < detectionThreshold + 0.04) next++;
+              while (next < data.columns && voiceLikelihood(data.speech[next], data.whisper[next], activeFocus.speechSensitivity) < threshold + 0.04) next++;
               if (next < data.columns) {
                 const nextTime = Math.max(time, next / data.columns * data.duration - 0.08);
                 if (nextTime - time > 0.2) {
@@ -128,21 +166,20 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
               }
             }
           }
-        } else publishNoiseReduction(0);
+        } else {
+          const context = contextRef.current;
+          if (context) {
+            adaptiveGateRef.current?.gain.setTargetAtTime(1, context.currentTime, 0.02);
+            adaptiveVoiceGainRef.current?.gain.setTargetAtTime(1, context.currentTime, 0.02);
+          }
+          publishNoiseReduction(0);
+        }
       }
       frameRef.current = requestAnimationFrame(tick);
     };
     frameRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frameRef.current);
   }, [publishNoiseReduction, updateMetrics]);
-
-  useEffect(() => {
-    if (focus.noiseProfileEnabled && focus.noiseFloor !== null) return;
-    const gate = adaptiveGateRef.current;
-    const context = contextRef.current;
-    if (gate && context) gate.gain.setTargetAtTime(1, context.currentTime, 0.018);
-    publishNoiseReduction(0);
-  }, [focus.noiseFloor, focus.noiseProfileEnabled, publishNoiseReduction]);
 
   useEffect(() => {
     const nodes = filtersRef.current;
@@ -152,16 +189,13 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
     const active = settings.enabled ? 1 : 0;
     wetGainRef.current.gain.setTargetAtTime(active, now, 0.015);
     dryGainRef.current.gain.setTargetAtTime(1 - active, now, 0.015);
-    const whisperRecovery = focus.whisperRecovery ? 1 : 0;
-    nodes.highpass.frequency.setTargetAtTime(65 + settings.strength * 45 - whisperRecovery * 18, now, 0.03);
-    nodes.low.gain.setTargetAtTime(-settings.suppression * 7, now, 0.03);
-    nodes.presence.gain.setTargetAtTime(settings.clarity * 8 + whisperRecovery * 2, now, 0.03);
-    nodes.articulation.gain.setTargetAtTime(whisperRecovery * (3 + settings.clarity * 5), now, 0.03);
-    nodes.lowpass.frequency.setTargetAtTime(20000 - whisperRecovery * 11800, now, 0.03);
-    nodes.comp.threshold.setTargetAtTime(-14 - settings.strength * 18 - whisperRecovery * 8, now, 0.03);
-    nodes.comp.ratio.setTargetAtTime(2 + settings.strength * 5, now, 0.03);
-    nodes.gain.gain.setTargetAtTime(Math.pow(10, ((settings.gain - 0.5) * 14 + settings.strength * 3 + whisperRecovery * 4) / 20), now, 0.03);
-  }, [focus.whisperRecovery, settings]);
+    applyFilterSettings(context, nodes, settings, focus);
+    if (!settings.enabled) {
+      adaptiveGateRef.current?.gain.setTargetAtTime(1, now, 0.015);
+      adaptiveVoiceGainRef.current?.gain.setTargetAtTime(1, now, 0.015);
+      publishNoiseReduction(0);
+    }
+  }, [focus, publishNoiseReduction, settings]);
 
   const ensureGraph = useCallback(() => {
     if (contextRef.current) return;
@@ -173,23 +207,35 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
     const dry = context.createGain(), wet = context.createGain(), master = context.createGain();
     const highpass = context.createBiquadFilter(); highpass.type = "highpass";
     const low = context.createBiquadFilter(); low.type = "lowshelf"; low.frequency.value = 230;
+    const hum50 = context.createBiquadFilter(); hum50.type = "peaking"; hum50.frequency.value = 50; hum50.Q.value = 12;
+    const hum100 = context.createBiquadFilter(); hum100.type = "peaking"; hum100.frequency.value = 100; hum100.Q.value = 10;
+    const mud = context.createBiquadFilter(); mud.type = "peaking"; mud.frequency.value = 430; mud.Q.value = 0.9;
+    const intelligibility = context.createBiquadFilter(); intelligibility.type = "peaking"; intelligibility.frequency.value = 1550; intelligibility.Q.value = 0.72;
     const presence = context.createBiquadFilter(); presence.type = "peaking"; presence.frequency.value = 2700; presence.Q.value = 0.75;
     const articulation = context.createBiquadFilter(); articulation.type = "peaking"; articulation.frequency.value = 4600; articulation.Q.value = 0.9;
+    const hiss = context.createBiquadFilter(); hiss.type = "highshelf"; hiss.frequency.value = 7200;
     const lowpass = context.createBiquadFilter(); lowpass.type = "lowpass"; lowpass.frequency.value = 20000; lowpass.Q.value = 0.7;
     const comp = context.createDynamicsCompressor(); comp.attack.value = 0.008; comp.release.value = 0.18; comp.knee.value = 12;
-    const gain = context.createGain(), adaptiveGate = context.createGain();
+    const gain = context.createGain(), adaptiveVoiceGain = context.createGain(), adaptiveGate = context.createGain();
     const limiter = context.createDynamicsCompressor();
     limiter.threshold.value = -1; limiter.knee.value = 0; limiter.ratio.value = 20; limiter.attack.value = 0.002; limiter.release.value = 0.08;
+    // Original/A receives the media element directly. Neural denoising and all
+    // EQ/dynamics live exclusively on the Enhanced/B branch.
+    source.connect(dry).connect(master);
     source.connect(neuralDry).connect(preprocess);
     neuralWet.connect(preprocess);
-    preprocess.connect(dry).connect(master);
-    preprocess.connect(highpass).connect(low).connect(presence).connect(articulation).connect(lowpass).connect(comp).connect(gain).connect(adaptiveGate).connect(wet).connect(master);
+    preprocess.connect(highpass).connect(low).connect(hum50).connect(hum100).connect(mud).connect(intelligibility).connect(presence).connect(articulation).connect(hiss).connect(lowpass).connect(comp).connect(gain).connect(adaptiveVoiceGain).connect(adaptiveGate).connect(wet).connect(master);
     master.connect(limiter).connect(context.destination);
-    dry.gain.value = 1; wet.gain.value = 0; neuralDry.gain.value = 1; neuralWet.gain.value = 0;
+    dry.gain.value = settingsRef.current.enabled ? 0 : 1;
+    wet.gain.value = settingsRef.current.enabled ? 1 : 0;
+    neuralDry.gain.value = 1; neuralWet.gain.value = 0;
+    adaptiveVoiceGain.gain.value = 1; adaptiveGate.gain.value = 1;
     master.gain.value = volumeValueRef.current;
     contextRef.current = context; sourceRef.current = source; wetGainRef.current = wet; dryGainRef.current = dry; masterGainRef.current = master;
-    neuralDryRef.current = neuralDry; neuralWetRef.current = neuralWet; adaptiveGateRef.current = adaptiveGate;
-    filtersRef.current = { highpass, low, presence, articulation, lowpass, comp, gain };
+    neuralDryRef.current = neuralDry; neuralWetRef.current = neuralWet; adaptiveGateRef.current = adaptiveGate; adaptiveVoiceGainRef.current = adaptiveVoiceGain;
+    const filters = { highpass, low, hum50, hum100, mud, intelligibility, presence, articulation, hiss, lowpass, comp, gain };
+    filtersRef.current = filters;
+    applyFilterSettings(context, filters, settingsRef.current, focusRef.current);
   }, []);
 
   const initRnnoise = useCallback(async () => {
@@ -208,8 +254,15 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
         const wasmBinary = await rnnoiseLibrary.loadRnnoise({ url: `${base}core.wasm`, simdUrl: `${base}core-simd.wasm` });
         await context.audioWorklet.addModule(`${base}processor.js`);
         const node = new rnnoiseLibrary.RnnoiseWorkletNode(context, { wasmBinary, maxChannels: 2 });
-        source.connect(node).connect(neuralWet);
+        node.connect(neuralWet);
         rnnoiseRef.current = node;
+        if (settingsRef.current.enabled && focusRef.current.neuralDenoise > 0) {
+          source.connect(node);
+          rnnoiseConnectedRef.current = true;
+          const amount = focusRef.current.neuralDenoise;
+          neuralDryRef.current?.gain.setTargetAtTime(1 - amount, context.currentTime, 0.035);
+          neuralWet.gain.setTargetAtTime(amount, context.currentTime, 0.035);
+        }
         setNeuralStatus("ready");
       } catch (cause) {
         setNeuralStatus("error");
@@ -233,18 +286,36 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
       wet.gain.setTargetAtTime(0, context.currentTime, 0.035);
       const node = rnnoiseRef.current;
       if (node) {
-        try { sourceRef.current?.disconnect(node); } catch { /* Already disconnected. */ }
+        if (rnnoiseConnectedRef.current) {
+          try { sourceRef.current?.disconnect(node); } catch { /* Already disconnected. */ }
+        }
+        rnnoiseConnectedRef.current = false;
         node.disconnect();
         node.port.close();
         rnnoiseRef.current = null;
       }
       return;
     }
-    if (focus.neuralDenoise > 0 && !rnnoiseRef.current) void initRnnoise();
+    if (!settings.enabled) {
+      dry.gain.setTargetAtTime(1, context.currentTime, 0.035);
+      wet.gain.setTargetAtTime(0, context.currentTime, 0.035);
+      if (rnnoiseRef.current && rnnoiseConnectedRef.current) {
+        try { sourceRef.current?.disconnect(rnnoiseRef.current); } catch { /* Already disconnected. */ }
+        rnnoiseConnectedRef.current = false;
+      }
+      return;
+    }
+    if (!rnnoiseRef.current) void initRnnoise();
+    if (rnnoiseRef.current && !rnnoiseConnectedRef.current) {
+      sourceRef.current?.connect(rnnoiseRef.current);
+      rnnoiseConnectedRef.current = true;
+    }
     const amount = rnnoiseRef.current ? focus.neuralDenoise : 0;
-    dry.gain.setTargetAtTime(Math.cos(amount * Math.PI / 2), context.currentTime, 0.035);
-    wet.gain.setTargetAtTime(Math.sin(amount * Math.PI / 2), context.currentTime, 0.035);
-  }, [focus.neuralDenoise, initRnnoise]);
+    // Linear crossfade avoids the +3 dB correlated-signal boost produced by
+    // equal-power mixing, which previously raised background noise.
+    dry.gain.setTargetAtTime(1 - amount, context.currentTime, 0.035);
+    wet.gain.setTargetAtTime(amount, context.currentTime, 0.035);
+  }, [focus.neuralDenoise, initRnnoise, settings.enabled]);
 
   const loadFile = useCallback(async (file: File, resumeAt = 0) => {
     const generation = ++loadGenerationRef.current;
@@ -255,20 +326,32 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
     fileRef.current = file;
     pendingSeekRef.current = Math.max(0, resumeAt);
     try {
-      const data = await file.arrayBuffer();
+      let encodedAudio = await file.arrayBuffer();
       const decodeContext = new AudioContext();
-      const buffer = await decodeContext.decodeAudioData(data);
+      const buffer = await decodeContext.decodeAudioData(encodedAudio);
+      encodedAudio = new ArrayBuffer(0);
       if (generation !== loadGenerationRef.current) {
         await decodeContext.close();
         return false;
       }
-      const mono = new Float32Array(buffer.length);
-      for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
-        const input = buffer.getChannelData(channel);
-        for (let i = 0; i < input.length; i++) mono[i] += input[i] / buffer.numberOfChannels;
+      // The media element handles full-quality playback. Analysis needs only a
+      // speech-band copy, so cap it at 12 kHz instead of retaining another
+      // full-rate 30–60 minute PCM allocation on memory-constrained iPads.
+      const analysisSampleRate = Math.min(12_000, buffer.sampleRate);
+      const analysisLength = Math.max(1, Math.ceil(buffer.duration * analysisSampleRate));
+      const mono = new Float32Array(analysisLength);
+      const ratio = buffer.sampleRate / analysisSampleRate;
+      const channels = Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel));
+      for (let index = 0; index < analysisLength; index++) {
+        const position = Math.min(buffer.length - 1, index * ratio);
+        const before = Math.floor(position);
+        const after = Math.min(buffer.length - 1, before + 1);
+        const fraction = position - before;
+        let mixed = 0;
+        for (const channel of channels) mixed += channel[before] * (1 - fraction) + channel[after] * fraction;
+        mono[index] = mixed / channels.length;
       }
       const decodedDuration = buffer.duration;
-      const sampleRate = buffer.sampleRate;
       await decodeContext.close();
       const worker = new Worker(new URL("../workers/analyze.worker.ts", import.meta.url), { type: "module" });
       analysisWorkerRef.current = worker;
@@ -278,7 +361,7 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
         if (message.type === "complete") { setAnalysis(message.analysis); setProgress(1); worker.terminate(); analysisWorkerRef.current = null; }
       };
       worker.onerror = () => { setError("The recording decoded, but spectral analysis could not finish."); worker.terminate(); analysisWorkerRef.current = null; };
-      worker.postMessage({ samples: mono, sampleRate, duration: decodedDuration }, [mono.buffer]);
+      worker.postMessage({ samples: mono, sampleRate: analysisSampleRate, duration: decodedDuration }, [mono.buffer]);
       if (urlRef.current) URL.revokeObjectURL(urlRef.current);
       const url = URL.createObjectURL(file); urlRef.current = url;
       if (audioRef.current) { audioRef.current.src = url; audioRef.current.load(); }
@@ -332,9 +415,15 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
   const playPause = useCallback(async () => {
     const audio = audioRef.current; if (!audio?.src) return;
     ensureGraph();
-    if (focusRef.current.neuralDenoise > 0) void initRnnoise();
+    if (settingsRef.current.enabled && focusRef.current.neuralDenoise > 0) void initRnnoise();
     await contextRef.current?.resume();
-    if (audio.paused) await audio.play(); else audio.pause();
+    if (audio.paused) {
+      try {
+        await audio.play();
+      } catch {
+        setError("Playback was blocked. Tap Play again after confirming the browser allows audio.");
+      }
+    } else audio.pause();
   }, [ensureGraph, initRnnoise]);
   const seek = useCallback((time: number) => { if (!audioRef.current) return; audioRef.current.currentTime = Math.max(0, Math.min(duration, time)); setCurrentTime(audioRef.current.currentTime); updateMetrics(audioRef.current.currentTime); }, [duration, updateMetrics]);
   const skip = useCallback((delta: number) => seek((audioRef.current?.currentTime || 0) + delta), [seek]);
@@ -357,6 +446,7 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
   useEffect(() => () => {
     analysisWorkerRef.current?.terminate();
     if (urlRef.current) URL.revokeObjectURL(urlRef.current);
+    rnnoiseRef.current?.port.close();
     contextRef.current?.close();
   }, []);
 

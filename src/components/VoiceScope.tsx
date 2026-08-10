@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Activity, AudioLines, BrainCircuit, Captions, ChevronRight, Ear, Focus, Gauge, Info, Languages, LockKeyhole, Pause, Play, Repeat2, RotateCcw, ScanLine, SlidersHorizontal, Sparkles, Upload, Volume2, Waves } from "lucide-react";
+import { Activity, AudioLines, BrainCircuit, Captions, ChevronRight, Ear, Focus, Gauge, Info, KeyRound, Languages, LockKeyhole, Pause, Play, Repeat2, RotateCcw, ScanLine, ShieldCheck, SlidersHorizontal, Sparkles, Upload, Volume2, Waves } from "lucide-react";
 import { Spectrogram3D } from "./Spectrogram3D";
 import { Overview, WindowWaveform } from "./Overview";
 import { KnobSlider } from "./KnobSlider";
@@ -10,12 +10,23 @@ import { useAudioEngine } from "@/hooks/useAudioEngine";
 import { analysisFrameAtTime } from "@/lib/analysisClock";
 import { db, formatTime } from "@/lib/format";
 import { getVisibleTimeRange } from "@/lib/timeWindow";
-import { forgetRecording, persistRecording, recoverRecording, recordingId, savePlaybackSnapshot } from "@/lib/audioSession";
+import { forgetRecording, inspectRecovery, persistEncryptedRecording, recoverEncryptedRecording, savePlaybackSnapshot } from "@/lib/audioSession";
+import type { RecoveryMetadata } from "@/lib/audioSession";
 import type { EnhanceSettings, FocusSettings, TranscriptLanguage, TranscriptWord } from "@/types/audio";
 
 export function VoiceScope() {
   const inputRef = useRef<HTMLInputElement>(null);
-  const [settings, setSettings] = useState<EnhanceSettings>({ enabled: false, strength: 0.58, clarity: 0.62, suppression: 0.48, gain: 0.55 });
+  const [settings, setSettings] = useState<EnhanceSettings>({
+    enabled: false,
+    strength: 0.58,
+    clarity: 0.62,
+    suppression: 0.48,
+    gain: 0.55,
+    deMuffle: 0.5,
+    humRemoval: 0.25,
+    hissReduction: 0.4,
+    whisperLift: 0.45,
+  });
   const [windowSeconds, setWindowSeconds] = useState(30);
   const [depth, setDepth] = useState(0.72);
   const [rate, setRateValue] = useState(1);
@@ -34,6 +45,10 @@ export function VoiceScope() {
   const [recoveryMessage, setRecoveryMessage] = useState("");
   const [recoveryAvailable, setRecoveryAvailable] = useState(false);
   const [recoveryWarning, setRecoveryWarning] = useState(false);
+  const [recoveryMode, setRecoveryMode] = useState<"sensitive" | "encrypted">("sensitive");
+  const [recoveryPassphrase, setRecoveryPassphrase] = useState("");
+  const [pendingRecovery, setPendingRecovery] = useState<RecoveryMetadata | null>(null);
+  const [unlockBusy, setUnlockBusy] = useState(false);
   const transcriptWorkerRef = useRef<Worker | null>(null);
   const activeTranscriptLanguageRef = useRef<TranscriptLanguage>("auto");
   const transcriptionRequestRef = useRef(0);
@@ -57,13 +72,17 @@ export function VoiceScope() {
   }, []);
 
   const applySpeechFocus = () => {
-    setSettings({ enabled: true, strength: 0.84, clarity: 0.82, suppression: 0.76, gain: 0.64 });
+    setSettings({ enabled: true, strength: 0.78, clarity: 0.82, suppression: 0.74, gain: 0.6, deMuffle: 0.78, humRemoval: 0.45, hissReduction: 0.62, whisperLift: 0.52 });
     setFocus((old) => ({ ...old, neuralDenoise: Math.max(old.neuralDenoise, 0.7), whisperRecovery: false }));
   };
 
   const applyWhisperRecovery = () => {
-    setSettings({ enabled: true, strength: 0.94, clarity: 0.94, suppression: 0.42, gain: 0.78 });
-    setFocus((old) => ({ ...old, neuralDenoise: Math.min(Math.max(old.neuralDenoise, 0.3), 0.5), speechSensitivity: 0.88, whisperRecovery: true }));
+    if (focus.whisperRecovery) {
+      setFocus((old) => ({ ...old, whisperRecovery: false }));
+      return;
+    }
+    setSettings({ enabled: true, strength: 0.72, clarity: 0.8, suppression: 0.7, gain: 0.62, deMuffle: 0.82, humRemoval: 0.5, hissReduction: 0.72, whisperLift: 0.88 });
+    setFocus((old) => ({ ...old, neuralDenoise: Math.min(Math.max(old.neuralDenoise, 0.3), 0.45), speechSensitivity: 0.86, whisperRecovery: true }));
   };
 
   const learnNoiseProfile = () => {
@@ -197,23 +216,39 @@ export function VoiceScope() {
     setFocus((old) => ({ ...old, noiseFloor: null, noiseProfileEnabled: false }));
     setNoiseConfidence(0);
     setNoiseHint("Use a quiet 5-second region");
-    setRecoveryMessage("Preparing a private recovery copy on this device…");
+    setRecoveryMessage(recoveryMode === "encrypted" ? "Preparing an encrypted recovery copy on this device…" : "Sensitive Session · no recording copy will be retained");
     setRecoveryWarning(false);
     const loaded = await engine.loadFile(file);
     if (!loaded) {
       setRecoveryMessage("");
       return;
     }
-    try {
-      const id = await persistRecording(file);
-      activeRecordingIdRef.current = id;
-      setRecoveryAvailable(true);
-      setRecoveryMessage("Reload protection active · recording retained locally for 24 hours");
-    } catch {
-      activeRecordingIdRef.current = recordingId(file);
+    if (recoveryMode === "sensitive") {
+      await forgetRecording().catch(() => undefined);
+      activeRecordingIdRef.current = "";
+      setRecoveryAvailable(false);
+      setRecoveryMessage("Sensitive Session active · reload requires the original recording");
+      return;
+    }
+    if (recoveryPassphrase.length < 12) {
+      await forgetRecording().catch(() => undefined);
+      activeRecordingIdRef.current = "";
       setRecoveryAvailable(false);
       setRecoveryWarning(true);
-      setRecoveryMessage("Recovery storage is unavailable · keep the original recording nearby");
+      setRecoveryMessage("Encrypted recovery was not saved · use a passphrase of at least 12 characters before loading audio");
+      return;
+    }
+    try {
+      const id = await persistEncryptedRecording(file, recoveryPassphrase);
+      activeRecordingIdRef.current = id;
+      setRecoveryPassphrase("");
+      setRecoveryAvailable(true);
+      setRecoveryMessage("AES-256-GCM recovery active · passphrase required after reload · expires in 24 hours");
+    } catch {
+      activeRecordingIdRef.current = "";
+      setRecoveryAvailable(false);
+      setRecoveryWarning(true);
+      setRecoveryMessage("Encrypted recovery is unavailable · keep the original recording nearby");
     }
   };
 
@@ -222,35 +257,55 @@ export function VoiceScope() {
     restoreStartedRef.current = true;
     void (async () => {
       try {
-        const recovered = await recoverRecording();
-        if (!recovered) return;
-        activeRecordingIdRef.current = recovered.recordingId;
-        const snapshot = recovered.snapshot;
-        if (snapshot) {
-          setRateValue(snapshot.rate);
-          setVolumeValue(snapshot.volume);
-          setLoopValue(snapshot.loop);
-        }
-        setRecoveryMessage("Restoring the previous private session…");
-        const loaded = await loadAudioFile(recovered.file, snapshot?.currentTime ?? 0);
-        if (!loaded) {
-          setRecoveryWarning(true);
-          setRecoveryMessage("The saved recording could not be restored · load the original file");
-          return;
-        }
-        if (snapshot) {
-          restoreRate(snapshot.rate);
-          restoreVolume(snapshot.volume);
-          restoreLoop(snapshot.loop);
-        }
+        const metadata = await inspectRecovery();
+        if (!metadata) return;
+        setPendingRecovery(metadata);
+        setRecoveryMode("encrypted");
         setRecoveryAvailable(true);
-        setRecoveryMessage(snapshot?.currentTime ? `Session restored at ${formatTime(snapshot.currentTime)}` : "Previous recording restored locally");
+        setRecoveryMessage(`Encrypted recovery found for ${metadata.name} · enter its passphrase to unlock`);
       } catch {
         setRecoveryWarning(true);
         setRecoveryMessage("Recovery storage is unavailable · load the original recording");
       }
     })();
   }, [loadAudioFile, restoreLoop, restoreRate, restoreVolume]);
+
+  const unlockRecovery = async () => {
+    if (recoveryPassphrase.length < 12 || unlockBusy) return;
+    setUnlockBusy(true);
+    setRecoveryWarning(false);
+    setRecoveryMessage("Decrypting the saved recording locally…");
+    try {
+      const recovered = await recoverEncryptedRecording(recoveryPassphrase);
+      if (!recovered) {
+        setPendingRecovery(null);
+        setRecoveryAvailable(false);
+        setRecoveryMessage("No valid recovery copy remains");
+        return;
+      }
+      activeRecordingIdRef.current = recovered.recordingId;
+      const snapshot = recovered.snapshot;
+      const loaded = await loadAudioFile(recovered.file, snapshot?.currentTime ?? 0);
+      if (!loaded) throw new Error("decode failed");
+      if (snapshot) {
+        setRateValue(snapshot.rate);
+        setVolumeValue(snapshot.volume);
+        setLoopValue(snapshot.loop);
+        restoreRate(snapshot.rate);
+        restoreVolume(snapshot.volume);
+        restoreLoop(snapshot.loop);
+      }
+      setPendingRecovery(null);
+      setRecoveryPassphrase("");
+      setRecoveryAvailable(true);
+      setRecoveryMessage(snapshot?.currentTime ? `Encrypted session restored at ${formatTime(snapshot.currentTime)}` : "Encrypted recording restored locally");
+    } catch {
+      setRecoveryWarning(true);
+      setRecoveryMessage("Unlock failed · check the passphrase; the encrypted copy was not deleted");
+    } finally {
+      setUnlockBusy(false);
+    }
+  };
 
   useEffect(() => {
     if (!ready) return;
@@ -281,6 +336,8 @@ export function VoiceScope() {
     try {
       await forgetRecording();
       activeRecordingIdRef.current = "";
+      setPendingRecovery(null);
+      setRecoveryPassphrase("");
       setRecoveryAvailable(false);
       setRecoveryWarning(true);
       setRecoveryMessage("Recovery copy removed · a reload will require the original recording");
@@ -305,6 +362,14 @@ export function VoiceScope() {
           <div><span className="eyebrow"><Waves/> SPECTRAL TERRAIN</span><h2>{engine.fileName || "No recording loaded"}</h2></div>
           <div className="analysis-state"><i className={engine.analysis ? "live" : ""}/>{engine.analysis ? "ANALYSIS READY" : engine.progress ? `ANALYZING ${Math.round(engine.progress * 100)}%` : "AWAITING SIGNAL"}</div>
         </div>
+        <section className="session-security" aria-label="Recording recovery security">
+          <div className="session-security-title"><ShieldCheck/><span><b>Session storage</b><small>Choose before loading a recording</small></span></div>
+          <div className="session-mode" role="group" aria-label="Session storage mode">
+            <button aria-pressed={recoveryMode === "sensitive"} className={recoveryMode === "sensitive" ? "selected" : ""} disabled={ready || Boolean(pendingRecovery)} onClick={() => setRecoveryMode("sensitive")}>Sensitive · retain nothing</button>
+            <button aria-pressed={recoveryMode === "encrypted"} className={recoveryMode === "encrypted" ? "selected" : ""} disabled={ready || Boolean(pendingRecovery)} onClick={() => setRecoveryMode("encrypted")}>Encrypted recovery · 24 h</button>
+          </div>
+          {recoveryMode === "encrypted" && (!ready || pendingRecovery) ? <div className="recovery-key"><KeyRound/><label htmlFor="recovery-passphrase"><b>{pendingRecovery ? `Unlock ${pendingRecovery.name}` : "Recovery passphrase"}</b><small>At least 12 characters · never stored or uploaded</small></label><input id="recovery-passphrase" type="password" minLength={12} autoComplete="new-password" value={recoveryPassphrase} onChange={(event) => setRecoveryPassphrase(event.target.value)}/>{pendingRecovery ? <button disabled={unlockBusy || recoveryPassphrase.length < 12} onClick={() => void unlockRecovery()}>{unlockBusy ? "Unlocking…" : "Unlock"}</button> : null}</div> : null}
+        </section>
         {recoveryMessage ? <div className={recoveryWarning ? "session-recovery warning" : "session-recovery"}><span><LockKeyhole/><b>{recoveryMessage}</b></span>{recoveryAvailable ? <button onClick={() => void forgetRecovery()}>Forget recovery copy</button> : null}</div> : null}
         {engine.error && <div className="error"><Info/>{engine.error}</div>}
         <Spectrogram3D analysis={engine.analysis} currentTime={engine.currentTime} windowSeconds={windowSeconds} depth={depth}/>
@@ -319,7 +384,7 @@ export function VoiceScope() {
         </div>
 
         <div className="overview-wrap">
-          <div className="overview-labels"><span>FULL RECORDING · HEATMAP + WAVEFORM</span><span>{formatTime(engine.duration)}</span></div>
+          <div className="overview-labels"><span>FULL RECORDING · COARSE NAVIGATION HEATMAP + WAVEFORM</span><span>{formatTime(engine.duration)}</span></div>
           <Overview analysis={engine.analysis} currentTime={engine.currentTime} duration={engine.duration} onSeek={engine.seek}/>
           <div className="vad-row"><span>VOICE + WHISPER ACTIVITY</span><div className="vad-track">{engine.analysis && Array.from({length: 80}, (_, i) => { const idx = Math.floor(i / 80 * engine.analysis!.columns); const likelihood = Math.max(engine.analysis!.speech[idx], engine.analysis!.whisper[idx] * .9); return <i key={i} style={{ opacity: likelihood >= detectionThreshold ? .3 + likelihood * .7 : .04 }}/>; })}</div></div>
         </div>
@@ -337,29 +402,33 @@ export function VoiceScope() {
       <aside className="inspector">
         <div className="inspector-title"><SlidersHorizontal/><span>VOICE PROCESSOR</span></div>
         <div className="enhance-card">
-          <div className="enhance-header"><div className="enhance-icon"><Sparkles/></div><div><b>Voice Enhance</b><span>Adaptive speech clarity</span></div><button role="switch" aria-checked={settings.enabled} className={settings.enabled ? "toggle on" : "toggle"} onClick={() => setSetting("enabled", !settings.enabled)}><i/></button></div>
+          <div className="enhance-header"><div className="enhance-icon"><Sparkles/></div><div><b>Voice Enhance</b><span>Adaptive speech clarity</span></div><button role="switch" aria-label="Voice Enhance" aria-checked={settings.enabled} className={settings.enabled ? "toggle on" : "toggle"} onClick={() => setSetting("enabled", !settings.enabled)}><i/></button></div>
           <div className="ab-control"><button className={!settings.enabled ? "selected" : ""} onClick={() => setSetting("enabled", false)}>A · ORIGINAL</button><button className={settings.enabled ? "selected" : ""} onClick={() => setSetting("enabled", true)}>B · ENHANCED</button></div>
           <KnobSlider label="Enhance strength" value={settings.strength} onChange={(v) => setSetting("strength", v)}/>
           <KnobSlider label="Clarity / presence" value={settings.clarity} onChange={(v) => setSetting("clarity", v)}/>
           <KnobSlider label="Noise suppression" value={settings.suppression} onChange={(v) => setSetting("suppression", v)}/>
           <KnobSlider label="Voice gain" value={settings.gain} onChange={(v) => setSetting("gain", v)}/>
-          <div className="chain"><span>HPF</span><ChevronRight/><span>EQ</span><ChevronRight/><span>COMP</span><ChevronRight/><span>LIMIT</span></div>
+          <KnobSlider label="De-muffle" value={settings.deMuffle} onChange={(v) => setSetting("deMuffle", v)}/>
+          <KnobSlider label="50 Hz hum removal" value={settings.humRemoval} onChange={(v) => setSetting("humRemoval", v)}/>
+          <KnobSlider label="Hiss / sibilance control" value={settings.hissReduction} onChange={(v) => setSetting("hissReduction", v)}/>
+          <KnobSlider label="Adaptive whisper lift" value={settings.whisperLift} onChange={(v) => setSetting("whisperLift", v)}/>
+          <div className="chain"><span>HPF</span><ChevronRight/><span>HUM</span><ChevronRight/><span>DE-MUFFLE</span><ChevronRight/><span>EXPAND</span><ChevronRight/><span>LIMIT</span></div>
           <button className="focus-preset" onClick={applySpeechFocus}><Focus/><span><b>Speech Focus preset</b><small>Strong clarity + RNNoise</small></span></button>
-          <button className={focus.whisperRecovery ? "focus-preset whisper-preset active" : "focus-preset whisper-preset"} onClick={applyWhisperRecovery}><Ear/><span><b>Whisper Recovery preset</b><small>Preserves and lifts faint breathy speech</small></span></button>
+          <button aria-pressed={focus.whisperRecovery} className={focus.whisperRecovery ? "focus-preset whisper-preset active" : "focus-preset whisper-preset"} onClick={applyWhisperRecovery}><Ear/><span><b>Whisper Recovery {focus.whisperRecovery ? "on" : "preset"}</b><small>Voice-gated lift without broad noise amplification</small></span></button>
           <div className="focus-tools">
             <button onClick={learnNoiseProfile} disabled={!engine.analysis}><ScanLine/><span><b>Learn noise profile</b><small>{noiseHint}</small></span></button>
             <label className="feature-toggle"><span><b>Use learned profile</b><small>{focus.noiseFloor === null ? "Learn a quiet region first" : !focus.noiseProfileEnabled ? `Ready · ${noiseConfidence}% confidence` : !settings.enabled ? "Paused in Original/A" : engine.noiseReductionDb > 0.1 ? `Reducing ${engine.noiseReductionDb.toFixed(1)} dB now` : `Active · monitoring · ${noiseConfidence}% confidence`}</small></span><button role="switch" aria-label="Use learned noise profile" aria-checked={focus.noiseProfileEnabled} className={focus.noiseProfileEnabled ? "toggle on" : "toggle"} onClick={() => setNoiseProfileEnabled(!focus.noiseProfileEnabled)} disabled={focus.noiseFloor === null}><i/></button></label>
             {focus.noiseFloor !== null ? <button className="noise-reset" onClick={resetNoiseProfile}><RotateCcw/><span><b>Reset noise profile</b><small>Forget the learned threshold</small></span></button> : null}
-            <label className="feature-toggle"><span><b>Voice-only playback</b><small>Skips detected non-speech</small></span><button role="switch" aria-checked={focus.voiceOnly} className={focus.voiceOnly ? "toggle on" : "toggle"} onClick={() => setFocus((old) => ({ ...old, voiceOnly: !old.voiceOnly }))} disabled={!ready}><i/></button></label>
+            <label className="feature-toggle"><span><b>Voice-only playback</b><small>Skips detected non-speech</small></span><button role="switch" aria-label="Voice-only playback" aria-checked={focus.voiceOnly} className={focus.voiceOnly ? "toggle on" : "toggle"} onClick={() => setFocus((old) => ({ ...old, voiceOnly: !old.voiceOnly }))} disabled={!ready}><i/></button></label>
           </div>
-          <label className="neural-slider"><span><BrainCircuit/><b>Local neural denoising</b><output>{Math.round(focus.neuralDenoise * 100)}%</output></span><input type="range" min="0" max="1" step=".05" value={focus.neuralDenoise} onChange={(e) => setFocus((old) => ({ ...old, neuralDenoise: Number(e.target.value) }))}/><small>{focus.neuralDenoise === 0 ? "Off" : engine.neuralStatus === "loading" ? "Loading RNNoise locally…" : engine.neuralStatus === "error" ? `RNNoise unavailable: ${engine.neuralDetail}` : engine.neuralStatus === "ready" ? "RNNoise active · audio stays on device" : "Ready to load when playback starts"}</small></label>
+          <label className="neural-slider"><span><BrainCircuit/><b>Local neural denoising</b><output>{Math.round(focus.neuralDenoise * 100)}%</output></span><input type="range" min="0" max="1" step=".05" value={focus.neuralDenoise} onChange={(e) => setFocus((old) => ({ ...old, neuralDenoise: Number(e.target.value) }))}/><small>{focus.neuralDenoise === 0 ? "Off" : !settings.enabled ? "Paused in Original/A" : engine.neuralStatus === "loading" ? "Loading RNNoise locally…" : engine.neuralStatus === "error" ? `RNNoise unavailable: ${engine.neuralDetail}` : engine.neuralStatus === "ready" ? "RNNoise active · audio stays on device" : "Ready to load when playback starts"}</small></label>
           <label className="neural-slider sensitivity-slider"><span><Activity/><b>Speech / whisper sensitivity</b><output>{Math.round(focus.speechSensitivity * 100)}%</output></span><input type="range" min="0" max="1" step=".05" value={focus.speechSensitivity} onChange={(e) => setFocus((old) => ({ ...old, speechSensitivity: Number(e.target.value) }))}/><small>Higher values preserve fainter candidates but may include more background sound.</small></label>
         </div>
 
         <div className="inspector-title transcript-title"><Captions/><span>LOCAL TRANSCRIPT</span></div>
         <div className="transcript-card">
           <label className="transcript-language"><Languages/><span><b>Spoken language</b><small>Choose a language for muffled audio</small></span><select value={transcriptLanguage} disabled={transcriptBusy} onChange={(event) => { const language = event.target.value as TranscriptLanguage; setTranscriptLanguage(language); if (transcriptionEnabled) void startTranscription(language); }}><option value="auto">Auto detect</option><option value="en">English</option><option value="hi">हिन्दी · Hindi</option><option value="mr">मराठी · Marathi</option></select></label>
-          <div className="feature-toggle"><span><b>Whisper transcription</b><small>English · Hindi · Marathi · word timestamps</small></span><button role="switch" aria-checked={transcriptionEnabled} className={transcriptionEnabled ? "toggle on" : "toggle"} onClick={() => { if (transcriptionEnabled) stopTranscription(); else void startTranscription(); }} disabled={!ready}><i/></button></div>
+          <div className="feature-toggle"><span><b>Whisper transcription</b><small>English · Hindi · Marathi · word timestamps</small></span><button role="switch" aria-label="Whisper transcription" aria-checked={transcriptionEnabled} className={transcriptionEnabled ? "toggle on" : "toggle"} onClick={() => { if (transcriptionEnabled) stopTranscription(); else void startTranscription(); }} disabled={!ready}><i/></button></div>
           {transcriptionEnabled && <>
             <div className="transcript-progress"><i style={{ width: `${transcriptProgress * 100}%` }}/></div>
             <p className="transcript-status">{transcriptStatus}</p>
@@ -372,11 +441,14 @@ export function VoiceScope() {
         <div className="voice-status"><div className={liveVoiceLikelihood >= detectionThreshold ? "pulse speaking" : "pulse"}><Activity/></div><div><span>CURRENT DETECTION</span><b>{whisperPresent ? "WHISPER-LIKE SPEECH" : liveVoiceLikelihood >= detectionThreshold ? "VOICE PRESENT" : ready ? "AMBIENT / SILENCE" : "NO SIGNAL"}</b></div></div>
         <div className="probability"><span><b>Speech likelihood</b><strong>{Math.round(engine.metrics.speech * 100)}%</strong></span><div><i style={{width: `${engine.metrics.speech * 100}%`}}/></div></div>
         <div className="probability whisper-probability"><span><b>Whisper likelihood</b><strong>{Math.round(engine.metrics.whisper * 100)}%</strong></span><div><i style={{width: `${engine.metrics.whisper * 100}%`}}/></div></div>
+        <div className="probability noise-probability"><span><b>Background-noise likelihood</b><strong>{Math.round(engine.metrics.noise * 100)}%</strong></span><div><i style={{width: `${engine.metrics.noise * 100}%`}}/></div></div>
         <div className="metric-grid">
           <div><span>DOMINANT</span><b>{engine.metrics.dominant >= 1000 ? `${(engine.metrics.dominant / 1000).toFixed(2)} kHz` : `${Math.round(engine.metrics.dominant)} Hz`}</b></div>
           <div><span>PEAK LEVEL</span><b>{db(engine.metrics.peak)}</b></div>
           <div><span>RMS LEVEL</span><b>{db(engine.metrics.rms)}</b></div>
           <div><span>POSITION</span><b>{formatTime(engine.currentTime)}</b></div>
+          <div><span>SPEECH CLARITY</span><b>{Math.round(engine.metrics.clarity * 100)}%</b></div>
+          <div><span>LIVE REDUCTION</span><b>{engine.noiseReductionDb.toFixed(1)} dB</b></div>
         </div>
         <div className="privacy-note"><LockKeyhole/><p><b>Local by design</b>Audio processing is performed locally in your browser in Version 1. Your recording is not uploaded to a server.</p></div>
       </aside>
