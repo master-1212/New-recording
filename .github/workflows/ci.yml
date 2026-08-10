@@ -33,7 +33,7 @@ jobs:
         run: corepack enable && corepack prepare pnpm@11.16.0 --activate
 
       - name: Install exactly the reviewed lockfile
-        run: pnpm install --frozen-lockfile --ignore-scripts
+        run: pnpm install --frozen-lockfile
 
       - name: Fetch and verify hash-pinned runtime binaries
         run: pnpm vendor:runtime
