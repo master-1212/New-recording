@@ -25,6 +25,17 @@ test("CI actions are immutable and run with read-only repository permission", as
   assert.match(workflow, /persist-credentials: false/);
 });
 
+test("dependency build scripts are denied unless explicitly reviewed", async () => {
+  const workspace = await read("pnpm-workspace.yaml");
+  const workflow = await read(".github/workflows/ci.yml");
+  assert.match(workspace, /allowBuilds:\s+unrs-resolver: true/);
+  assert.match(workspace, /strictDepBuilds: true/);
+  assert.doesNotMatch(workspace, /dangerouslyAllowAllBuilds: true/);
+  assert.doesNotMatch(workspace, /onlyBuiltDependencies:/);
+  assert.match(workflow, /pnpm install --frozen-lockfile/);
+  assert.doesNotMatch(workflow, /pnpm install[^\n]*--ignore-scripts/);
+});
+
 test("runtime code is hash-verified during the build and no mutable proxy route remains", async () => {
   assert.equal(existsSync(join(root, "src/app/runtime/[asset]/route.ts")), false);
   for (const file of ["kernel.js", "processor.js", "core.wasm", "core-simd.wasm", "ml-kernel-v3.js", "ort-wasm-simd-threaded.jsep.wasm"]) {
