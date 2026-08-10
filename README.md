@@ -9,31 +9,40 @@ Transport playback supports 0.5×–2× speed with pitch preservation, ±10-seco
 - `src/hooks/useAudioEngine.ts` owns decoding, transport synchronization, the Web Audio graph, and DSP state.
 - `src/workers/analyze.worker.ts` creates bounded-resolution waveform, log-frequency spectral, level, dominant-frequency, voice-activity, whisper-likelihood, acoustic voice-profile data, and a capped high-resolution noise envelope off the UI thread.
 - `src/workers/transcribe.worker.ts` lazily loads Whisper in a dedicated worker and returns clickable word-level timestamps without uploading the recording.
-- `src/lib/audioSession.ts` provides best-effort 24-hour crash/reload recovery using an IndexedDB recording blob and a small versioned playback snapshot in local storage.
+- `src/lib/audioSession.ts` provides opt-in 24-hour crash/reload recovery using chunked AES-256-GCM encryption, PBKDF2-SHA-256 passphrase derivation, and an encrypted IndexedDB payload. Sensitive Session mode writes no recording or playback snapshot.
+- `src/lib/dsp.ts` contains deterministic parameter and adaptive-frame calculations shared by playback and automated diagnostics.
 - `src/components/Spectrogram3D.tsx` renders only a playback-centered spectral window on the GPU. Orbit controls provide mouse/touch rotation, pinch zoom, and pan.
 - `src/components/Overview.tsx` draws both a zoomed waveform synchronized to the 3D visible window and the full-recording heatmap, waveform, VAD, and seek cursor. Both views use the same clamped time-range function, including near the beginning and end of a recording.
 
 ## Spectrogram and performance
 
-Audio is decoded once for the initial analysis and mixed to mono. The worker uses a shared sample-based clock and caps analysis at 12,000 time columns (targeting four columns per second) and 72 logarithmic frequency bands, transferring typed-array buffers without copying. It keeps local FFT-window peaks separate from whole-column overview peaks so the waveform, spectral surface, and playhead refer to the same time frames. A separate 10 Hz noise envelope is capped at 36,000 frames (about 144 KB) so five-second noise learning remains precise on long recordings. The 3D surface samples only 96 × 36 vertices around the playhead, renders on demand, and explicitly disposes replaced GPU geometries. Playback-facing React state is bounded to about 15 updates per second, and the expensive full-recording heatmap is painted only when analysis or its display size changes. This tiered resolution keeps memory and CPU use bounded for 30–60 minute recordings.
+Audio is decoded once for the initial analysis and resampled directly into a speech-band 12 kHz mono copy instead of retaining a full-rate mono duplicate. The worker uses a shared sample-based clock and caps analysis at 12,000 time columns (targeting four columns per second) and 72 logarithmic frequency bands, transferring typed-array buffers without copying. It keeps local FFT-window peaks separate from whole-column overview peaks so the waveform, spectral surface, and playhead refer to the same time frames. A separate 10 Hz noise envelope is capped at 36,000 frames (about 144 KB) so five-second noise learning remains precise on long recordings. The 3D surface samples only 96 × 36 vertices around the playhead, renders on demand, and explicitly disposes replaced GPU geometries. Playback-facing React state is bounded to about 15 updates per second, and the expensive full-recording heatmap is painted only when analysis or its display size changes. This tiered resolution keeps memory and CPU use bounded for 30–60 minute recordings.
 
 The app does not retain a full-length 16 kHz transcription copy during ordinary playback. It creates that temporary PCM data only after the user enables transcription, transfers it to the worker, and releases it when the worker finishes or is cancelled. RNNoise is also disconnected when its slider returns to zero. These choices substantially reduce steady-state memory pressure on iPad Safari.
 
 ## Voice Enhance DSP
 
-The enhanced branch uses an adjustable high-pass filter, low-shelf attenuation, 2.7 kHz presence EQ, soft-knee compressor, makeup gain, an adaptive learned-noise gate, and the browser output limiter. A parallel dry branch makes the A/B transition immediate and click-free. The shared master stage supports 0–500% gain and feeds a fast limiter to reduce clipping at high boost.
+Original/A is a direct media-source branch. Enhanced/B independently uses a high-pass filter, low-shelf attenuation, narrow 50/100 Hz hum rejection, 430 Hz mud reduction, 1.55 kHz de-muffling, 2.7 kHz presence, 4.6 kHz articulation, high-frequency hiss control, controlled compression, adaptive voice-only lift, adaptive noise expansion, and a fast output limiter. The true dry/wet branches make A/B switching immediate and click-free. The shared master stage supports 0–500% gain and feeds the limiter to reduce clipping at high boost.
 
 Speech Focus applies a strong intelligibility preset and enables a 70% RNNoise blend. RNNoise runs as a local WASM `AudioWorklet`; the slider crossfades it with the unprocessed signal. Learn Noise Profile samples an exact five-second region from the high-resolution envelope, rejects speech/whisper candidates, calculates a confidence score, and automatically enables the Enhanced/B path. The learned profile has its own Active switch and Reset control, while live feedback reports its current attenuation. Original/A remains a true unprocessed reference. Voice-only playback uses the VAD timeline to skip sustained non-speech sections.
 
-Whisper Recovery is a separate faint-speech preset. It raises the 2.7–4.6 kHz articulation region, uses deeper controlled compression and makeup gain, limits very high-frequency hiss, reduces the learned gate's maximum attenuation, increases speech/whisper sensitivity, and keeps RNNoise moderate so breathy consonants are less likely to be removed as noise. The whisper indicator is a spectral/energy heuristic, not identity recognition or forensic proof.
+Whisper Recovery is a separate, reversible faint-speech mode. It no longer applies a broad high-gain boost. Instead, the analysis worker provides speech, whisper, spectral-noise, and clarity vectors; credible whisper frames receive up to 6 dB of smoothed adaptive lift while background-only frames receive no lift and can receive additional attenuation. RNNoise uses a linear correlated-signal crossfade so partial settings do not create the previous +3 dB-style mixing bump. Compression and static makeup are deliberately moderate, and the high-frequency cutoff preserves more breath consonants. The whisper indicator is a spectral/energy heuristic, not identity recognition or forensic proof.
 
 ## Local Whisper transcription
 
-Whisper transcription is opt-in. The language selector supports automatic detection plus explicit English, Hindi, and Marathi modes. Explicit language selection is recommended for muffled recordings. On first use, the browser downloads the quantized multilingual `whisper-tiny_timestamped` model and caches it; inference then runs locally on temporary 16 kHz audio in a Web Worker. Words are timestamped and can be tapped to seek. Each transcription run prepares its own temporary speech-rate copy and terminates the worker afterward so neither the PCM data nor model remains in live application memory—important on iPad. Audio is never sent to the CDN or model host: those services provide code/model assets only. A small same-origin Vercel route proxies and caches allowlisted runtime assets so Safari content blockers do not have to permit third-party executable files; it never accepts or transmits user audio. An internet connection is required the first time RNNoise or Whisper is enabled.
+Whisper transcription is opt-in. The language selector supports automatic detection plus explicit English, Hindi, and Marathi modes. Explicit language selection is recommended for muffled recordings. On first use, the browser downloads the quantized multilingual `whisper-tiny_timestamped` model from immutable revision `517244293732ee2d58139af5814231b7e6830a0d` and caches it; inference then runs locally on temporary 16 kHz audio in a Web Worker. Words are timestamped and can be tapped to seek. Each transcription run prepares its own temporary speech-rate copy and terminates the worker afterward so neither the PCM data nor model remains in live application memory—important on iPad. Audio is never sent to the model host. Transformers.js, ONNX Runtime Web, RNNoise, and the AudioWorklet are reviewed, SHA-256-locked files served from `public/runtime`; CI rejects any byte change. An internet connection is required only for the first Whisper model download.
 
 ## Reload recovery and privacy
 
-After a recording decodes successfully, VoiceScope makes a best-effort recovery copy in the browser's IndexedDB and saves playback position, speed, loop, and volume every three seconds and whenever the page is hidden. If iPad Safari evicts or reloads the tab, the app automatically restores the recording and position but remains paused because iOS blocks autoplay without a tap. Recovery data stays on the device, expires after 24 hours, is replaced by the next recording, and can be removed immediately with **Forget recovery copy**. Private browsing, storage quotas, or very large files can prevent recovery; the UI reports that state rather than claiming protection.
+Sensitive Session is the default and retains nothing after a reload. Optional Encrypted Recovery requires a passphrase of at least 12 characters before loading audio. The recording is encrypted in 4 MiB chunks with AES-256-GCM; its key is derived with 600,000 PBKDF2-SHA-256 iterations and is never stored. Playback position, speed, loop, and volume are associated with the encrypted copy. After a reload, the user must re-enter the passphrase before VoiceScope can decrypt and restore the recording. Recovery expires after 24 hours and can be removed immediately with **Forget recovery copy**. The Version 1 plaintext recovery database is deleted automatically during migration.
+
+## Security hardening
+
+- Exact dependency and package-manager versions; frozen lockfile CI; a three-day minimum package age; blocked exotic transitive sources; and explicit install-script allowlisting.
+- GitHub Actions have read-only repository permission, do not persist credentials, and are pinned to full commit SHAs. Dependabot, CODEOWNERS, a security policy, and a security/quality workflow are included.
+- A restrictive Content Security Policy, anti-framing, no-referrer, HSTS, origin isolation, content-type protection, and disabled device permissions are sent on every response.
+- Runtime executable assets are fetched only from exact package versions, rejected unless their pinned SHA-256 digests match, and then served from the same origin. The large generated files are excluded from Git history. Uploaded audio has no server route and is never placed in build output.
+- Repository rulesets, account passkeys/2FA, GitHub secret scanning/CodeQL availability, Vercel team/token restrictions, macOS FileVault/firewall, and OS updates remain account/device controls that must be enabled by their owner; source code cannot safely toggle them.
 
 ## Voice Profile Analysis
 
@@ -48,7 +57,10 @@ Designed for current Safari on iPad/iPhone and current Safari, Chrome, Edge, and
 ## Local development
 
 ```bash
+corepack enable
+corepack prepare pnpm@11.16.0 --activate
 pnpm install
+pnpm vendor:runtime
 pnpm dev
 ```
 
@@ -57,6 +69,9 @@ Validation:
 ```bash
 pnpm lint
 pnpm typecheck
+pnpm test
+pnpm verify:runtime
+pnpm security:audit
 pnpm build
 ```
 

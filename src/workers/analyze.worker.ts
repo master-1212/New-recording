@@ -18,6 +18,8 @@ ctx.onmessage = ({ data }: MessageEvent<Request>) => {
   const peak = new Float32Array(columns);
   const speech = new Float32Array(columns);
   const whisper = new Float32Array(columns);
+  const noise = new Float32Array(columns);
+  const clarity = new Float32Array(columns);
   const pitch = new Float32Array(columns);
   const profile = new Float32Array(columns);
   const profileConfidence = new Float32Array(columns);
@@ -34,6 +36,7 @@ ctx.onmessage = ({ data }: MessageEvent<Request>) => {
   const pitchFrame = new Float32Array(480);
   const pitchScores = new Float32Array(110);
   const clock = { duration, columns, sampleRate, totalSamples: samples.length };
+  const maximumFrequency = Math.min(20_000, sampleRate * 0.49);
   for (let index = 0; index < fftSize; index++) fftWindow[index] = 0.5 - 0.5 * Math.cos((2 * Math.PI * index) / (fftSize - 1));
   for (let index = 0; index < fftSize / 2; index++) {
     const angle = -2 * Math.PI * index / fftSize;
@@ -84,9 +87,10 @@ ctx.onmessage = ({ data }: MessageEvent<Request>) => {
 
     fft(re, im, twiddleReal, twiddleImaginary);
     let best = 0, bestBin = 0, voiceEnergy = 0, highSpeechEnergy = 0, lowEnergy = 0, totalEnergy = 0;
+    let logBandEnergy = 0, meanBandEnergy = 0, activeBands = 0;
     for (let b = 0; b < bands; b++) {
-      const lowHz = 45 * Math.pow(20000 / 45, b / bands);
-      const highHz = 45 * Math.pow(20000 / 45, (b + 1) / bands);
+      const lowHz = 45 * Math.pow(maximumFrequency / 45, b / bands);
+      const highHz = 45 * Math.pow(maximumFrequency / 45, (b + 1) / bands);
       const lowBin = Math.max(1, Math.floor(lowHz * fftSize / sampleRate));
       const highBin = Math.min(fftSize / 2, Math.max(lowBin + 1, Math.ceil(highHz * fftSize / sampleRate)));
       let energy = 0;
@@ -94,6 +98,9 @@ ctx.onmessage = ({ data }: MessageEvent<Request>) => {
       const normalized = Math.max(0, Math.min(1, (20 * Math.log10(energy / fftSize + 1e-7) + 90) / 78));
       spectral[c * bands + b] = Math.round(normalized * 255);
       totalEnergy += energy;
+      logBandEnergy += Math.log(Math.max(energy, 1e-12));
+      meanBandEnergy += energy;
+      activeBands++;
       if (lowHz >= 100 && lowHz <= 5000) voiceEnergy += energy;
       if (lowHz >= 900 && lowHz <= 7000) highSpeechEnergy += energy;
       if (lowHz < 250) lowEnergy += energy;
@@ -103,6 +110,7 @@ ctx.onmessage = ({ data }: MessageEvent<Request>) => {
     const highSpeechRatio = highSpeechEnergy / Math.max(1e-8, totalEnergy);
     const lowRatio = lowEnergy / Math.max(1e-8, totalEnergy);
     const zcr = zc / Math.max(1, count);
+    const flatness = Math.min(1, Math.exp(logBandEnergy / Math.max(1, activeBands)) / Math.max(1e-12, meanBandEnergy / Math.max(1, activeBands)));
     const levelScore = Math.min(1, Math.max(0, (20 * Math.log10(level + 1e-7) + 52) / 38));
     speech[c] = Math.min(1, levelScore * 0.52 + voiceRatio * 0.65 + Math.min(zcr * 7, 0.2));
     const faintLevelScore = Math.min(1, Math.max(0, (20 * Math.log10(level + 1e-7) + 72) / 46));
@@ -111,6 +119,8 @@ ctx.onmessage = ({ data }: MessageEvent<Request>) => {
     whisper[c] = Math.min(1, Math.max(0,
       faintLevelScore * 0.22 + voiceRatio * 0.32 + highSpeechRatio * 0.58 + breathiness * 0.16 - lowRatio * 0.28 - 0.22,
     ));
+    noise[c] = Math.min(1, Math.max(0, flatness * 0.58 + (1 - voiceRatio) * 0.32 + lowRatio * 0.2 - levelScore * 0.08));
+    clarity[c] = Math.min(1, Math.max(0, voiceRatio * 0.48 + highSpeechRatio * 0.52 - flatness * 0.38 - lowRatio * 0.16));
     if (speech[c] > 0.38 && level > 0.00008) {
       const estimate = estimatePitch(samples, frame.centerSample, sampleRate, pitchFrame, pitchScores);
       rawPitch[c] = estimate.hz;
@@ -124,15 +134,17 @@ ctx.onmessage = ({ data }: MessageEvent<Request>) => {
     if (speech[c] < 0.42 || rawPitch[c] <= 0 || periodicity[c] < 0.48) continue;
     const semitonesFromCenter = 12 * Math.log2(rawPitch[c] / 170);
     const separation = Math.min(1, Math.max(0, (Math.abs(semitonesFromCenter) - 1.2) / 4.8));
-    const clarity = Math.min(1, Math.max(0, (periodicity[c] - 0.46) / 0.44));
+    const periodicityClarity = Math.min(1, Math.max(0, (periodicity[c] - 0.46) / 0.44));
     const whisperPenalty = whisper[c] > speech[c] ? 0.45 : 1;
     pitch[c] = rawPitch[c];
     profile[c] = Math.min(1, Math.max(-1, semitonesFromCenter / 6));
-    profileConfidence[c] = Math.min(1, separation * clarity * speech[c] * whisperPenalty);
+    profileConfidence[c] = Math.min(1, separation * periodicityClarity * speech[c] * whisperPenalty);
+    noise[c] *= 1 - periodicity[c] * 0.58;
+    clarity[c] = Math.min(1, clarity[c] + periodicity[c] * 0.3);
   }
 
-  ctx.postMessage({ type: "complete", analysis: { duration, columns, bands, sampleRate, totalSamples: samples.length, waveform, overviewWaveform, spectral, rms, peak, speech, whisper, pitch, profile, profileConfidence, noiseFrames, noiseRms, dominant } },
-    [waveform.buffer, overviewWaveform.buffer, spectral.buffer, rms.buffer, peak.buffer, speech.buffer, whisper.buffer, pitch.buffer, profile.buffer, profileConfidence.buffer, noiseRms.buffer, dominant.buffer]);
+  ctx.postMessage({ type: "complete", analysis: { duration, columns, bands, sampleRate, totalSamples: samples.length, waveform, overviewWaveform, spectral, rms, peak, speech, whisper, noise, clarity, pitch, profile, profileConfidence, noiseFrames, noiseRms, dominant } },
+    [waveform.buffer, overviewWaveform.buffer, spectral.buffer, rms.buffer, peak.buffer, speech.buffer, whisper.buffer, noise.buffer, clarity.buffer, pitch.buffer, profile.buffer, profileConfidence.buffer, noiseRms.buffer, dominant.buffer]);
 };
 
 function estimatePitch(samples: Float32Array, center: number, sampleRate: number, frame: Float32Array, scores: Float32Array) {

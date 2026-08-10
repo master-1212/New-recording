@@ -2,29 +2,41 @@
   "name": "voicescope-3d",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.16.0",
+  "engines": {
+    "node": ">=24.0.0 <25",
+    "pnpm": ">=11.16.0 <12"
+  },
   "scripts": {
     "dev": "next dev",
+    "prebuild": "pnpm vendor:runtime",
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types tests/*.test.mts",
+    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
+    "vendor:runtime": "node scripts/vendor-runtime.mjs --write",
+    "verify:runtime": "node scripts/vendor-runtime.mjs --verify",
+    "security:audit": "pnpm audit --audit-level high"
   },
   "dependencies": {
-    "@react-three/drei": "latest",
-    "@react-three/fiber": "latest",
-    "lucide-react": "latest",
-    "next": "latest",
-    "react": "latest",
-    "react-dom": "latest",
-    "three": "latest"
+    "@react-three/drei": "10.7.8",
+    "@react-three/fiber": "9.7.0",
+    "lucide-react": "1.29.0",
+    "next": "16.3.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "three": "0.185.1"
   },
   "devDependencies": {
-    "@types/node": "latest",
-    "@types/react": "latest",
-    "@types/react-dom": "latest",
-    "@types/three": "latest",
-    "eslint": "^9.39.2",
-    "eslint-config-next": "latest",
-    "typescript": "^5.9.3"
+    "@types/node": "26.1.2",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@types/three": "0.185.4",
+    "eslint": "9.39.5",
+    "eslint-config-next": "16.3.0",
+    "typescript": "5.9.3"
   }
 }

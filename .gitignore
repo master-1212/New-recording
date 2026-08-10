@@ -7,3 +7,40 @@ out
 .DS_Store
 next-env.d.ts
 *.tsbuildinfo
+
+# Local secrets and credentials. Commit a redacted .env.example only.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.crt
+*.mobileprovision
+
+# Local databases and accidental user recordings never belong in source control.
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.m4a
+*.aac
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.opus
+*.mp4
+*.mov
+*.webm
+
+# Test artifacts and local security reports.
+coverage
+test-results
+playwright-report
+*.sarif
+
+# Generated at build time from version-pinned, SHA-256-verified upstream bytes.
+public/runtime/

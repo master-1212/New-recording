@@ -11,6 +11,8 @@ export type AnalysisData = {
   peak: Float32Array;
   speech: Float32Array;
   whisper: Float32Array;
+  noise: Float32Array;
+  clarity: Float32Array;
   pitch: Float32Array;
   profile: Float32Array;
   profileConfidence: Float32Array;
@@ -25,6 +27,10 @@ export type EnhanceSettings = {
   clarity: number;
   suppression: number;
   gain: number;
+  deMuffle: number;
+  humRemoval: number;
+  hissReduction: number;
+  whisperLift: number;
 };
 
 export type FocusSettings = {
@@ -47,6 +53,8 @@ export type TranscriptWord = {
 export type LiveMetrics = {
   speech: number;
   whisper: number;
+  noise: number;
+  clarity: number;
   pitch: number;
   profile: number;
   profileConfidence: number;

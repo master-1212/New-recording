@@ -6,5 +6,5 @@ export default defineConfig([
   ...nextVitals,
   ...nextTs,
   { rules: { "react-hooks/refs": "off" } },
-  globalIgnores([".next/**", "node_modules/**", "next-env.d.ts"])
+  globalIgnores([".next/**", "node_modules/**", "public/runtime/**", "next-env.d.ts"])
 ]);

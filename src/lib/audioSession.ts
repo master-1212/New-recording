@@ -1,13 +1,19 @@
 const DATABASE_NAME = "voicescope-local-recovery";
-const DATABASE_VERSION = 1;
+const DATABASE_VERSION = 2;
 const RECORDING_STORE = "recordings";
 const ACTIVE_RECORDING_KEY = "active-recording";
-const SESSION_STATE_KEY = "voicescope:playback:v1";
+const SESSION_STATE_KEY = "voicescope:playback:v2";
 const MAX_RECOVERY_AGE_MS = 24 * 60 * 60 * 1000;
+const CHUNK_BYTES = 4 * 1024 * 1024;
+const PBKDF2_ITERATIONS = 600_000;
 
-type StoredRecording = {
+type StoredEncryptedRecording = {
   key: typeof ACTIVE_RECORDING_KEY;
-  blob: Blob;
+  version: 2;
+  chunks: ArrayBuffer[];
+  salt: Uint8Array<ArrayBuffer>;
+  noncePrefix: Uint8Array<ArrayBuffer>;
+  iterations: number;
   name: string;
   type: string;
   size: number;
@@ -15,6 +21,8 @@ type StoredRecording = {
   recordingId: string;
   savedAt: number;
 };
+
+export type RecoveryMetadata = Pick<StoredEncryptedRecording, "name" | "size" | "recordingId" | "savedAt">;
 
 export type PlaybackSnapshot = {
   recordingId: string;
@@ -39,9 +47,14 @@ function openDatabase() {
   return new Promise<IDBDatabase>((resolve, reject) => {
     if (typeof indexedDB === "undefined") return reject(new Error("IndexedDB is unavailable"));
     const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
-    request.onupgradeneeded = () => {
-      if (!request.result.objectStoreNames.contains(RECORDING_STORE)) {
-        request.result.createObjectStore(RECORDING_STORE, { keyPath: "key" });
+    request.onupgradeneeded = (event) => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(RECORDING_STORE)) {
+        database.createObjectStore(RECORDING_STORE, { keyPath: "key" });
+      } else if ((event as IDBVersionChangeEvent).oldVersion < 2) {
+        // Version 1 stored plaintext recording blobs. Remove them during the
+        // security migration rather than silently keeping sensitive data.
+        request.transaction?.objectStore(RECORDING_STORE).clear();
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -68,15 +81,75 @@ function runTransaction<T>(mode: IDBTransactionMode, operation: (store: IDBObjec
   }));
 }
 
-export async function persistRecording(file: File) {
-  const stored: StoredRecording = {
+function requireCrypto() {
+  if (!globalThis.crypto?.subtle) throw new Error("Encrypted recovery requires a secure browser context");
+  return globalThis.crypto;
+}
+
+async function deriveKey(passphrase: string, salt: Uint8Array<ArrayBuffer>, iterations: number, usage: KeyUsage[]) {
+  if (passphrase.length < 12) throw new Error("Use a recovery passphrase with at least 12 characters");
+  const browserCrypto = requireCrypto();
+  const material = await browserCrypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(passphrase),
+    "PBKDF2",
+    false,
+    ["deriveKey"],
+  );
+  return browserCrypto.subtle.deriveKey(
+    { name: "PBKDF2", hash: "SHA-256", salt, iterations },
+    material,
+    { name: "AES-GCM", length: 256 },
+    false,
+    usage,
+  );
+}
+
+function nonce(prefix: Uint8Array<ArrayBuffer>, index: number) {
+  const value = new Uint8Array(12);
+  value.set(prefix, 0);
+  new DataView(value.buffer).setUint32(8, index, false);
+  return value;
+}
+
+function authenticatedMetadata(stored: Pick<StoredEncryptedRecording, "name" | "size" | "lastModified" | "recordingId">, index: number, count: number) {
+  return new TextEncoder().encode(JSON.stringify({
+    name: stored.name,
+    size: stored.size,
+    lastModified: stored.lastModified,
+    recordingId: stored.recordingId,
+    index,
+    count,
+  }));
+}
+
+export async function persistEncryptedRecording(file: File, passphrase: string) {
+  const browserCrypto = requireCrypto();
+  const salt = browserCrypto.getRandomValues(new Uint8Array(16));
+  const noncePrefix = browserCrypto.getRandomValues(new Uint8Array(8));
+  const key = await deriveKey(passphrase, salt, PBKDF2_ITERATIONS, ["encrypt"]);
+  const count = Math.max(1, Math.ceil(file.size / CHUNK_BYTES));
+  if (count >= 0xffff_ffff) throw new Error("Recording is too large for encrypted recovery");
+  const identity = recordingId(file);
+  const metadata = { name: file.name, size: file.size, lastModified: file.lastModified, recordingId: identity };
+  const chunks: ArrayBuffer[] = [];
+  for (let index = 0; index < count; index++) {
+    const plain = await file.slice(index * CHUNK_BYTES, Math.min(file.size, (index + 1) * CHUNK_BYTES)).arrayBuffer();
+    chunks.push(await browserCrypto.subtle.encrypt(
+      { name: "AES-GCM", iv: nonce(noncePrefix, index), additionalData: authenticatedMetadata(metadata, index, count), tagLength: 128 },
+      key,
+      plain,
+    ));
+  }
+  const stored: StoredEncryptedRecording = {
     key: ACTIVE_RECORDING_KEY,
-    blob: file,
-    name: file.name,
+    version: 2,
+    chunks,
+    salt,
+    noncePrefix,
+    iterations: PBKDF2_ITERATIONS,
     type: file.type,
-    size: file.size,
-    lastModified: file.lastModified,
-    recordingId: recordingId(file),
+    ...metadata,
     savedAt: Date.now(),
   };
   await runTransaction("readwrite", (store) => store.put(stored));
@@ -85,17 +158,38 @@ export async function persistRecording(file: File) {
   } catch {
     // Recovery remains best-effort when persistent storage is unavailable.
   }
-  return stored.recordingId;
+  return identity;
 }
 
-export async function recoverRecording(): Promise<RecoveredRecording | null> {
-  const stored = await runTransaction<StoredRecording | undefined>("readonly", (store) => store.get(ACTIVE_RECORDING_KEY));
+async function storedRecovery() {
+  const stored = await runTransaction<StoredEncryptedRecording | undefined>("readonly", (store) => store.get(ACTIVE_RECORDING_KEY));
   if (!stored) return null;
-  if (Date.now() - stored.savedAt > MAX_RECOVERY_AGE_MS) {
+  if (stored.version !== 2 || Date.now() - stored.savedAt > MAX_RECOVERY_AGE_MS) {
     await forgetRecording();
     return null;
   }
-  const file = new File([stored.blob], stored.name, { type: stored.type, lastModified: stored.lastModified });
+  return stored;
+}
+
+export async function inspectRecovery(): Promise<RecoveryMetadata | null> {
+  const stored = await storedRecovery();
+  if (!stored) return null;
+  return { name: stored.name, size: stored.size, recordingId: stored.recordingId, savedAt: stored.savedAt };
+}
+
+export async function recoverEncryptedRecording(passphrase: string): Promise<RecoveredRecording | null> {
+  const stored = await storedRecovery();
+  if (!stored) return null;
+  const key = await deriveKey(passphrase, stored.salt, stored.iterations, ["decrypt"]);
+  const plainChunks: ArrayBuffer[] = [];
+  for (let index = 0; index < stored.chunks.length; index++) {
+    plainChunks.push(await requireCrypto().subtle.decrypt(
+      { name: "AES-GCM", iv: nonce(stored.noncePrefix, index), additionalData: authenticatedMetadata(stored, index, stored.chunks.length), tagLength: 128 },
+      key,
+      stored.chunks[index],
+    ));
+  }
+  const file = new File(plainChunks, stored.name, { type: stored.type, lastModified: stored.lastModified });
   const snapshot = loadPlaybackSnapshot();
   return {
     file,
@@ -142,6 +236,8 @@ export function loadPlaybackSnapshot(): PlaybackSnapshot | null {
 export function clearPlaybackSnapshot() {
   try {
     localStorage.removeItem(SESSION_STATE_KEY);
+    // Remove the older unencrypted session snapshot during migration.
+    localStorage.removeItem("voicescope:playback:v1");
   } catch {
     // Storage may be disabled.
   }
