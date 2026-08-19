@@ -51,6 +51,7 @@ test("runtime code is hash-verified during the build and no mutable proxy route 
   assert.match(ignore, /public\/runtime\//);
   assert.match(worker, /revision: "[0-9a-f]{40}"/);
   assert.match(worker, /wasmPaths = "\/runtime\/"/);
+  assert.equal(existsSync(join(root, "public/worklets/spectral-denoise.js")), true, "same-origin spectral worklet is missing");
 });
 
 test("security headers isolate the app and block framing", async () => {

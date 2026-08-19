@@ -16,6 +16,7 @@ const settings = {
 
 const focus = {
   noiseFloor: null,
+  noiseSpectrum: null,
   noiseProfileEnabled: false,
   speechSensitivity: 0.86,
   whisperRecovery: true,
@@ -29,7 +30,7 @@ test("sensitivity lowers the detection threshold without exceeding bounds", () =
 
 test("Whisper Recovery does not add broad unconditional makeup gain", () => {
   const parameters = computeDspParameters(settings, focus);
-  assert.ok(parameters.makeupDb < 3.5, `unexpected ${parameters.makeupDb.toFixed(2)} dB makeup`);
+  assert.ok(parameters.makeupDb <= 0.5, `unexpected ${parameters.makeupDb.toFixed(2)} dB makeup`);
   assert.ok(parameters.lowpassHz >= 13000, "speech consonants should not be cut at the old 8.2 kHz limit");
   assert.ok(parameters.compressorRatio < 5, "whispers should not be crushed by the old high-ratio compressor");
 });

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { analysisFrameAtTime } from "@/lib/analysisClock";
 import { computeAdaptiveFrame, computeDspParameters, voiceLikelihood } from "@/lib/dsp";
-import type { AnalysisData, EnhanceSettings, FocusSettings, LiveMetrics } from "@/types/audio";
+import type { AnalysisData, EnhanceSettings, FocusSettings, LiveMetrics, TranscriptionPreprocess } from "@/types/audio";
 
 const emptyMetrics: LiveMetrics = { speech: 0, whisper: 0, noise: 0, clarity: 0, pitch: 0, profile: 0, profileConfidence: 0, peak: 0, rms: 0, dominant: 0 };
 
@@ -57,13 +57,16 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
   const rnnoiseRef = useRef<AudioWorkletNode | null>(null);
   const rnnoiseConnectedRef = useRef(false);
   const rnnoisePromiseRef = useRef<Promise<void> | null>(null);
+  const graphPromiseRef = useRef<Promise<void> | null>(null);
+  const spectralDenoiseRef = useRef<AudioWorkletNode | null>(null);
+  const spectralReductionRef = useRef(0);
   const adaptiveGateRef = useRef<GainNode | null>(null);
   const adaptiveVoiceGainRef = useRef<GainNode | null>(null);
   const fileRef = useRef<File | null>(null);
   const analysisWorkerRef = useRef<Worker | null>(null);
   const pendingSeekRef = useRef(0);
   const loadGenerationRef = useRef(0);
-  const transcriptionPromiseRef = useRef<Promise<Float32Array | null> | null>(null);
+  const transcriptionPromiseRef = useRef<Promise<{ audio: Float32Array; preprocess: TranscriptionPreprocess } | null> | null>(null);
   const focusRef = useRef(focus);
   const settingsRef = useRef(settings);
   const analysisRef = useRef<AnalysisData | null>(null);
@@ -86,6 +89,7 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
   const [noiseReductionDb, setNoiseReductionDb] = useState(0);
   const [neuralStatus, setNeuralStatus] = useState<"off" | "loading" | "ready" | "error">("off");
   const [neuralDetail, setNeuralDetail] = useState("");
+  const [spectralStatus, setSpectralStatus] = useState<"off" | "loading" | "ready" | "error">("off");
 
   useEffect(() => { focusRef.current = focus; }, [focus]);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
@@ -146,7 +150,7 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
             }, settingsRef.current, activeFocus);
             gate.gain.setTargetAtTime(adaptive.gateGain, context.currentTime, adaptive.gateGain < 1 ? 0.045 : 0.02);
             voiceGain.gain.setTargetAtTime(adaptive.voiceGain, context.currentTime, adaptive.voiceGain > 1 ? 0.055 : 0.025);
-            publishNoiseReduction(adaptive.reductionDb);
+            publishNoiseReduction(adaptive.reductionDb + spectralReductionRef.current);
           }
           if (activeFocus.voiceOnly && likelihood < threshold - 0.06 && time - lastVoiceSkipRef.current > 0.25) {
             const confirmation = Math.max(2, Math.ceil(data.columns / data.duration * 0.35));
@@ -197,8 +201,25 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
     }
   }, [focus, publishNoiseReduction, settings]);
 
-  const ensureGraph = useCallback(() => {
-    if (contextRef.current) return;
+  useEffect(() => {
+    const node = spectralDenoiseRef.current;
+    if (!node) return;
+    node.port.postMessage({
+      type: "configure",
+      enabled: settings.enabled && focus.noiseProfileEnabled && Boolean(focus.noiseSpectrum?.length),
+      amount: settings.suppression,
+      profile: focus.noiseSpectrum ?? [],
+      minimumFrequency: 45,
+      maximumFrequency: analysisRef.current ? analysisRef.current.sampleRate * 0.49 : 5_800,
+    });
+    if (!settings.enabled || !focus.noiseProfileEnabled) spectralReductionRef.current = 0;
+  }, [focus.noiseProfileEnabled, focus.noiseSpectrum, settings.enabled, settings.suppression]);
+
+  const ensureGraph = useCallback(async () => {
+    if (contextRef.current) {
+      await graphPromiseRef.current;
+      return;
+    }
     const audio = audioRef.current;
     if (!audio) return;
     const context = new AudioContext();
@@ -236,6 +257,35 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
     const filters = { highpass, low, hum50, hum100, mud, intelligibility, presence, articulation, hiss, lowpass, comp, gain };
     filtersRef.current = filters;
     applyFilterSettings(context, filters, settingsRef.current, focusRef.current);
+    const task = (async () => {
+      setSpectralStatus("loading");
+      try {
+        await context.audioWorklet.addModule("/worklets/spectral-denoise.js");
+        const node = new AudioWorkletNode(context, "voicescope-spectral-denoise", { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2] });
+        preprocess.disconnect(highpass);
+        preprocess.connect(node).connect(highpass);
+        node.port.onmessage = ({ data }) => {
+          if (data?.type !== "reduction") return;
+          spectralReductionRef.current = Number.isFinite(data.value) ? data.value : 0;
+        };
+        node.port.postMessage({
+          type: "configure",
+          enabled: settingsRef.current.enabled && focusRef.current.noiseProfileEnabled && Boolean(focusRef.current.noiseSpectrum?.length),
+          amount: settingsRef.current.suppression,
+          profile: focusRef.current.noiseSpectrum ?? [],
+          minimumFrequency: 45,
+          maximumFrequency: analysisRef.current ? analysisRef.current.sampleRate * 0.49 : 5_800,
+        });
+        spectralDenoiseRef.current = node;
+        setSpectralStatus("ready");
+      } catch {
+        spectralDenoiseRef.current = null;
+        setSpectralStatus("error");
+      }
+    })();
+    graphPromiseRef.current = task;
+    await task;
+    if (graphPromiseRef.current === task) graphPromiseRef.current = null;
   }, []);
 
   const initRnnoise = useCallback(async () => {
@@ -399,7 +449,34 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
           for (const channel of channels) for (let sample = start; sample < end; sample++) sum += channel[sample];
           output[index] = sum / Math.max(1, (end - start) * channels.length);
         }
-        return generation === loadGenerationRef.current ? output : null;
+        if (generation !== loadGenerationRef.current) return null;
+        const data = analysisRef.current;
+        const activeSettings = settingsRef.current;
+        const activeFocus = focusRef.current;
+        const activity = data ? new Float32Array(data.columns) : null;
+        if (data && activity) {
+          for (let index = 0; index < data.columns; index++) activity[index] = voiceLikelihood(data.speech[index], data.whisper[index], activeFocus.speechSensitivity);
+        }
+        const availableSpectrum = activeFocus.noiseSpectrum?.length
+          ? new Float32Array(activeFocus.noiseSpectrum)
+          : data && data.noiseFloorEstimate > 0 && data.noiseProfileConfidence > 0 && data.noiseSpectrum.length
+            ? new Float32Array(data.noiseSpectrum)
+            : null;
+        const preprocess: TranscriptionPreprocess = {
+          enabled: activeSettings.enabled,
+          sampleRate: targetRate,
+          duration: buffer.duration,
+          suppression: activeSettings.suppression,
+          clarity: activeSettings.clarity,
+          deMuffle: activeSettings.deMuffle,
+          whisperLift: activeSettings.whisperLift,
+          whisperRecovery: activeFocus.whisperRecovery,
+          noiseSpectrum: availableSpectrum,
+          noiseSpectrumMinHz: 45,
+          noiseSpectrumMaxHz: data ? data.sampleRate * 0.49 : 5_800,
+          activity,
+        };
+        return { audio: output, preprocess };
       } finally {
         await decodeContext.close();
       }
@@ -414,7 +491,7 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
 
   const playPause = useCallback(async () => {
     const audio = audioRef.current; if (!audio?.src) return;
-    ensureGraph();
+    await ensureGraph();
     if (settingsRef.current.enabled && focusRef.current.neuralDenoise > 0) void initRnnoise();
     await contextRef.current?.resume();
     if (audio.paused) {
@@ -447,10 +524,11 @@ export function useAudioEngine(settings: EnhanceSettings, focus: FocusSettings) 
     analysisWorkerRef.current?.terminate();
     if (urlRef.current) URL.revokeObjectURL(urlRef.current);
     rnnoiseRef.current?.port.close();
+    spectralDenoiseRef.current?.port.close();
     contextRef.current?.close();
   }, []);
 
-  return { audioRef, fileName, duration, currentTime, playing, analysis, progress, error, metrics, noiseReductionDb, neuralStatus, neuralDetail, loadFile, playPause, seek, skip,
+  return { audioRef, fileName, duration, currentTime, playing, analysis, progress, error, metrics, noiseReductionDb, neuralStatus, neuralDetail, spectralStatus, loadFile, playPause, seek, skip,
     prepareTranscriptionAudio,
     getCurrentTime,
     setRate,
