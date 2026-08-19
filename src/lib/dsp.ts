@@ -39,6 +39,8 @@ export function voiceLikelihood(speech: number, whisper: number, sensitivity: nu
 
 export function computeDspParameters(settings: DspSettings, focus: Pick<DspFocus, "whisperRecovery">) {
   const whisperMode = focus.whisperRecovery ? 1 : 0;
+  const ordinaryMakeupDb = (settings.gain - 0.5) * 10 + settings.strength * 1.5;
+  const whisperMakeupDb = Math.min(0.5, Math.max(-1, (settings.gain - 0.5) * 4 + settings.strength * 0.4));
   return {
     highpassHz: 62 + settings.strength * 35 + settings.suppression * 8 - whisperMode * 7,
     lowShelfDb: -settings.suppression * (3.5 + settings.deMuffle * 3.5),
@@ -52,7 +54,7 @@ export function computeDspParameters(settings: DspSettings, focus: Pick<DspFocus
     lowpassHz: 20000 - settings.hissReduction * 7000 - whisperMode * 1000,
     compressorThresholdDb: -15 - settings.strength * 14 - whisperMode * 3,
     compressorRatio: 2 + settings.strength * 3.2,
-    makeupDb: (settings.gain - 0.5) * 10 + settings.strength * 1.5,
+    makeupDb: whisperMode ? whisperMakeupDb : ordinaryMakeupDb,
   };
 }
 

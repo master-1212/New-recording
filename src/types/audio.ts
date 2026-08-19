@@ -18,6 +18,9 @@ export type AnalysisData = {
   profileConfidence: Float32Array;
   noiseFrames: number;
   noiseRms: Float32Array;
+  noiseSpectrum: Float32Array;
+  noiseFloorEstimate: number;
+  noiseProfileConfidence: number;
   dominant: Float32Array;
 };
 
@@ -37,6 +40,7 @@ export type FocusSettings = {
   voiceOnly: boolean;
   neuralDenoise: number;
   noiseFloor: number | null;
+  noiseSpectrum: number[] | null;
   noiseProfileEnabled: boolean;
   speechSensitivity: number;
   whisperRecovery: boolean;
@@ -48,6 +52,21 @@ export type TranscriptWord = {
   text: string;
   start: number;
   end: number;
+};
+
+export type TranscriptionPreprocess = {
+  enabled: boolean;
+  sampleRate: number;
+  duration: number;
+  suppression: number;
+  clarity: number;
+  deMuffle: number;
+  whisperLift: number;
+  whisperRecovery: boolean;
+  noiseSpectrum: Float32Array | null;
+  noiseSpectrumMinHz: number;
+  noiseSpectrumMaxHz: number;
+  activity: Float32Array | null;
 };
 
 export type LiveMetrics = {

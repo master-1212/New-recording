@@ -30,6 +30,7 @@ test("dependency build scripts are denied unless explicitly reviewed", async () 
   const workflow = await read(".github/workflows/ci.yml");
   assert.match(workspace, /allowBuilds:\s+unrs-resolver: true/);
   assert.match(workspace, /strictDepBuilds: true/);
+  assert.match(workspace, /overrides:\n\s+nanoid: 3\.3\.18/, "patched nanoid override is missing");
   assert.doesNotMatch(workspace, /dangerouslyAllowAllBuilds: true/);
   assert.doesNotMatch(workspace, /onlyBuiltDependencies:/);
   assert.match(workflow, /pnpm install --frozen-lockfile/);
@@ -51,6 +52,7 @@ test("runtime code is hash-verified during the build and no mutable proxy route 
   assert.match(ignore, /public\/runtime\//);
   assert.match(worker, /revision: "[0-9a-f]{40}"/);
   assert.match(worker, /wasmPaths = "\/runtime\/"/);
+  assert.equal(existsSync(join(root, "public/worklets/spectral-denoise.js")), true, "same-origin spectral worklet is missing");
 });
 
 test("security headers isolate the app and block framing", async () => {

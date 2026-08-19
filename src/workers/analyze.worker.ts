@@ -1,6 +1,7 @@
 /// <reference lib="webworker" />
 
 import { analysisFrame } from "../lib/analysisClock";
+import { estimateNoiseFingerprint } from "../lib/noiseProfile";
 
 type Request = { samples: Float32Array; sampleRate: number; duration: number };
 
@@ -143,8 +144,13 @@ ctx.onmessage = ({ data }: MessageEvent<Request>) => {
     clarity[c] = Math.min(1, clarity[c] + periodicity[c] * 0.3);
   }
 
-  ctx.postMessage({ type: "complete", analysis: { duration, columns, bands, sampleRate, totalSamples: samples.length, waveform, overviewWaveform, spectral, rms, peak, speech, whisper, noise, clarity, pitch, profile, profileConfidence, noiseFrames, noiseRms, dominant } },
-    [waveform.buffer, overviewWaveform.buffer, spectral.buffer, rms.buffer, peak.buffer, speech.buffer, whisper.buffer, noise.buffer, clarity.buffer, pitch.buffer, profile.buffer, profileConfidence.buffer, noiseRms.buffer, dominant.buffer]);
+  const automaticProfile = estimateNoiseFingerprint({ bands, columns, spectral, rms, speech, whisper });
+  const noiseSpectrum = automaticProfile?.spectrumDb ?? new Float32Array(bands).fill(-90);
+  const noiseFloorEstimate = automaticProfile?.floor ?? 0;
+  const noiseProfileConfidence = automaticProfile?.confidence ?? 0;
+
+  ctx.postMessage({ type: "complete", analysis: { duration, columns, bands, sampleRate, totalSamples: samples.length, waveform, overviewWaveform, spectral, rms, peak, speech, whisper, noise, clarity, pitch, profile, profileConfidence, noiseFrames, noiseRms, noiseSpectrum, noiseFloorEstimate, noiseProfileConfidence, dominant } },
+    [waveform.buffer, overviewWaveform.buffer, spectral.buffer, rms.buffer, peak.buffer, speech.buffer, whisper.buffer, noise.buffer, clarity.buffer, pitch.buffer, profile.buffer, profileConfidence.buffer, noiseRms.buffer, noiseSpectrum.buffer, dominant.buffer]);
 };
 
 function estimatePitch(samples: Float32Array, center: number, sampleRate: number, frame: Float32Array, scores: Float32Array) {

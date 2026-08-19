@@ -7,8 +7,8 @@ import { Overview, WindowWaveform } from "./Overview";
 import { KnobSlider } from "./KnobSlider";
 import { VoiceProfilePanel } from "./VoiceProfilePanel";
 import { useAudioEngine } from "@/hooks/useAudioEngine";
-import { analysisFrameAtTime } from "@/lib/analysisClock";
 import { db, formatTime } from "@/lib/format";
+import { estimateNoiseFingerprint } from "@/lib/noiseProfile";
 import { getVisibleTimeRange } from "@/lib/timeWindow";
 import { forgetRecording, inspectRecovery, persistEncryptedRecording, recoverEncryptedRecording, savePlaybackSnapshot } from "@/lib/audioSession";
 import type { RecoveryMetadata } from "@/lib/audioSession";
@@ -32,16 +32,18 @@ export function VoiceScope() {
   const [rate, setRateValue] = useState(1);
   const [volume, setVolumeValue] = useState(0.9);
   const [loop, setLoopValue] = useState(false);
-  const [focus, setFocus] = useState<FocusSettings>({ voiceOnly: false, neuralDenoise: 0, noiseFloor: null, noiseProfileEnabled: false, speechSensitivity: 0.62, whisperRecovery: false });
+  const [focus, setFocus] = useState<FocusSettings>({ voiceOnly: false, neuralDenoise: 0, noiseFloor: null, noiseSpectrum: null, noiseProfileEnabled: false, speechSensitivity: 0.62, whisperRecovery: false });
   const [transcriptionEnabled, setTranscriptionEnabled] = useState(false);
   const [transcriptLanguage, setTranscriptLanguage] = useState<TranscriptLanguage>("auto");
   const [transcribedLanguage, setTranscribedLanguage] = useState<TranscriptLanguage | null>(null);
+  const [transcribedSignature, setTranscribedSignature] = useState<string | null>(null);
   const [transcriptBusy, setTranscriptBusy] = useState(false);
   const [transcriptStatus, setTranscriptStatus] = useState("Off");
   const [transcriptProgress, setTranscriptProgress] = useState(0);
   const [transcriptWords, setTranscriptWords] = useState<TranscriptWord[]>([]);
   const [noiseHint, setNoiseHint] = useState("Use a quiet 5-second region");
   const [noiseConfidence, setNoiseConfidence] = useState(0);
+  const [noiseProfileOrigin, setNoiseProfileOrigin] = useState<"none" | "automatic" | "learned">("none");
   const [recoveryMessage, setRecoveryMessage] = useState("");
   const [recoveryAvailable, setRecoveryAvailable] = useState(false);
   const [recoveryWarning, setRecoveryWarning] = useState(false);
@@ -51,6 +53,7 @@ export function VoiceScope() {
   const [unlockBusy, setUnlockBusy] = useState(false);
   const transcriptWorkerRef = useRef<Worker | null>(null);
   const activeTranscriptLanguageRef = useRef<TranscriptLanguage>("auto");
+  const activeTranscriptSignatureRef = useRef("");
   const transcriptionRequestRef = useRef(0);
   const activeRecordingIdRef = useRef("");
   const restoreStartedRef = useRef(false);
@@ -78,54 +81,74 @@ export function VoiceScope() {
 
   const applyWhisperRecovery = () => {
     if (focus.whisperRecovery) {
-      setFocus((old) => ({ ...old, whisperRecovery: false }));
+      setFocus((old) => ({
+        ...old,
+        whisperRecovery: false,
+        noiseFloor: noiseProfileOrigin === "automatic" ? null : old.noiseFloor,
+        noiseSpectrum: noiseProfileOrigin === "automatic" ? null : old.noiseSpectrum,
+        noiseProfileEnabled: noiseProfileOrigin === "automatic" ? false : old.noiseProfileEnabled,
+      }));
+      if (noiseProfileOrigin === "automatic") {
+        setNoiseProfileOrigin("none");
+        setNoiseConfidence(0);
+        setNoiseHint("Use a quiet 5-second region");
+      }
       return;
     }
-    setSettings({ enabled: true, strength: 0.72, clarity: 0.8, suppression: 0.7, gain: 0.62, deMuffle: 0.82, humRemoval: 0.5, hissReduction: 0.72, whisperLift: 0.88 });
-    setFocus((old) => ({ ...old, neuralDenoise: Math.min(Math.max(old.neuralDenoise, 0.3), 0.45), speechSensitivity: 0.86, whisperRecovery: true }));
+    const data = engine.analysis;
+    if (!data) {
+      setNoiseHint("Wait for spectral analysis before enabling Whisper Recovery");
+      return;
+    }
+    const hasAutomaticProfile = data.noiseFloorEstimate > 0
+      && data.noiseProfileConfidence > 0
+      && data.noiseSpectrum.length > 0
+      && data.noiseSpectrum.every(Number.isFinite);
+    setSettings({ enabled: true, strength: 0.58, clarity: 0.78, suppression: 0.82, gain: 0.5, deMuffle: 0.82, humRemoval: 0.5, hissReduction: 0.65, whisperLift: 0.75 });
+    setFocus((old) => ({
+      ...old,
+      neuralDenoise: Math.max(old.neuralDenoise, 0.65),
+      noiseFloor: hasAutomaticProfile ? data.noiseFloorEstimate : null,
+      noiseSpectrum: hasAutomaticProfile ? Array.from(data.noiseSpectrum) : null,
+      noiseProfileEnabled: hasAutomaticProfile,
+      speechSensitivity: 0.88,
+      whisperRecovery: true,
+    }));
+    setNoiseProfileOrigin(hasAutomaticProfile ? "automatic" : "none");
+    setNoiseConfidence(hasAutomaticProfile ? data.noiseProfileConfidence : 0);
+    setNoiseHint(hasAutomaticProfile
+      ? `Auto spectral fingerprint · ${db(data.noiseFloorEstimate)} · ${data.noiseProfileConfidence}% confidence`
+      : "No stable automatic fingerprint · select a quiet region and Learn");
   };
 
   const learnNoiseProfile = () => {
     const data = engine.analysis;
     if (!data?.duration || !data.noiseFrames) return;
     const range = getVisibleTimeRange(engine.currentTime, data.duration, Math.min(5, data.duration));
-    const start = Math.max(0, Math.floor(range.start / data.duration * data.noiseFrames));
-    const end = Math.min(data.noiseFrames, Math.ceil(range.end / data.duration * data.noiseFrames));
-    const candidates: number[] = [];
-    for (let frame = start; frame < end; frame++) {
-      const time = (frame + 0.5) / data.noiseFrames * data.duration;
-      const column = analysisFrameAtTime(data, time);
-      const voiced = data.pitch[column] > 0 && data.speech[column] > 0.45;
-      const strongWhisper = data.whisper[column] >= 0.62;
-      if (!voiced && !strongWhisper && data.noiseRms[frame] > 0) candidates.push(data.noiseRms[frame]);
-    }
-    const expected = Math.max(1, end - start);
-    if (candidates.length < Math.max(4, Math.ceil(expected * 0.35))) {
+    const start = Math.max(0, Math.floor(range.start / data.duration * data.columns));
+    const end = Math.min(data.columns, Math.ceil(range.end / data.duration * data.columns));
+    const fingerprint = estimateNoiseFingerprint(data, start, end);
+    if (!fingerprint) {
       setNoiseHint("Rejected · speech/whisper dominates this region");
       setNoiseConfidence(0);
       return;
     }
-    candidates.sort((a, b) => a - b);
-    const learned = candidates[Math.floor(candidates.length * 0.65)];
-    const low = candidates[Math.floor(candidates.length * 0.2)];
-    const high = candidates[Math.floor(candidates.length * 0.85)];
-    const coverage = Math.min(1, candidates.length / Math.max(1, expected * 0.7));
-    const spread = (high - low) / Math.max(learned, 1e-6);
-    const confidence = Math.round(100 * coverage * (1 - Math.min(0.55, spread * 0.28)));
-    setFocus((old) => ({ ...old, noiseFloor: learned, noiseProfileEnabled: true }));
+    setFocus((old) => ({ ...old, noiseFloor: fingerprint.floor, noiseSpectrum: Array.from(fingerprint.spectrumDb), noiseProfileEnabled: true }));
     setSetting("enabled", true);
-    setNoiseConfidence(confidence);
-    setNoiseHint(`Active · ${db(learned)} · ${confidence}% confidence`);
+    setNoiseProfileOrigin("learned");
+    setNoiseConfidence(fingerprint.confidence);
+    setNoiseHint(`Spectral fingerprint active · ${db(fingerprint.floor)} · ${fingerprint.confidence}% confidence`);
   };
 
   const setNoiseProfileEnabled = (enabled: boolean) => {
     if (enabled) setSetting("enabled", true);
-    setFocus((old) => ({ ...old, noiseProfileEnabled: enabled && old.noiseFloor !== null }));
+    setFocus((old) => ({ ...old, noiseProfileEnabled: enabled && old.noiseFloor !== null && Boolean(old.noiseSpectrum?.length) }));
     if (focus.noiseFloor !== null) setNoiseHint(`${enabled ? "Active" : "Learned · paused"} · ${db(focus.noiseFloor)} · ${noiseConfidence}% confidence`);
   };
 
   const resetNoiseProfile = () => {
-    setFocus((old) => ({ ...old, noiseFloor: null, noiseProfileEnabled: false }));
+    setFocus((old) => ({ ...old, noiseFloor: null, noiseSpectrum: null, noiseProfileEnabled: false }));
+    setNoiseProfileOrigin("none");
     setNoiseConfidence(0);
     setNoiseHint("Use a quiet 5-second region");
   };
@@ -141,6 +164,7 @@ export function VoiceScope() {
       if (data.type === "complete") {
         setTranscriptWords(data.words ?? []);
         setTranscribedLanguage(activeTranscriptLanguageRef.current);
+        setTranscribedSignature(activeTranscriptSignatureRef.current);
         setTranscriptStatus(data.words?.length ? `Complete · ${data.words.length} timed words` : "Complete · no clear speech detected");
         setTranscriptProgress(1);
         setTranscriptBusy(false);
@@ -168,7 +192,8 @@ export function VoiceScope() {
   const startTranscription = async (language = transcriptLanguage) => {
     if (!ready) return;
     if (transcriptBusy) return;
-    if (transcribedLanguage === language) {
+    const signature = JSON.stringify([language, settings.enabled, settings.suppression, settings.clarity, settings.deMuffle, settings.whisperLift, focus.whisperRecovery, focus.noiseProfileEnabled, noiseConfidence]);
+    if (transcribedLanguage === language && transcribedSignature === signature) {
       setTranscriptionEnabled(true);
       setTranscriptStatus("Complete · cached for this session");
       return;
@@ -180,17 +205,21 @@ export function VoiceScope() {
     setTranscriptStatus("Preparing a temporary 16 kHz speech copy…");
     setTranscriptProgress(0.01);
     activeTranscriptLanguageRef.current = language;
+    activeTranscriptSignatureRef.current = signature;
     const request = ++transcriptionRequestRef.current;
-    const audio = await engine.prepareTranscriptionAudio();
+    const prepared = await engine.prepareTranscriptionAudio();
     if (request !== transcriptionRequestRef.current) return;
-    if (!audio) {
+    if (!prepared) {
       setTranscriptStatus("The recording changed before transcription could start. Try again.");
       setTranscriptBusy(false);
       return;
     }
     setTranscriptStatus("Preparing local Whisper…");
     const worker = createTranscriptWorker();
-    worker.postMessage({ audio, language }, [audio.buffer]);
+    const transfers: Transferable[] = [prepared.audio.buffer];
+    if (prepared.preprocess.noiseSpectrum) transfers.push(prepared.preprocess.noiseSpectrum.buffer);
+    if (prepared.preprocess.activity) transfers.push(prepared.preprocess.activity.buffer);
+    worker.postMessage({ audio: prepared.audio, language, preprocess: prepared.preprocess }, transfers);
   };
 
   const stopTranscription = () => {
@@ -213,7 +242,9 @@ export function VoiceScope() {
     setTranscriptProgress(0);
     setTranscriptWords([]);
     setTranscribedLanguage(null);
-    setFocus((old) => ({ ...old, noiseFloor: null, noiseProfileEnabled: false }));
+    setTranscribedSignature(null);
+    setFocus((old) => ({ ...old, noiseFloor: null, noiseSpectrum: null, noiseProfileEnabled: false }));
+    setNoiseProfileOrigin("none");
     setNoiseConfidence(0);
     setNoiseHint("Use a quiet 5-second region");
     setRecoveryMessage(recoveryMode === "encrypted" ? "Preparing an encrypted recovery copy on this device…" : "Sensitive Session · no recording copy will be retained");
@@ -412,12 +443,12 @@ export function VoiceScope() {
           <KnobSlider label="50 Hz hum removal" value={settings.humRemoval} onChange={(v) => setSetting("humRemoval", v)}/>
           <KnobSlider label="Hiss / sibilance control" value={settings.hissReduction} onChange={(v) => setSetting("hissReduction", v)}/>
           <KnobSlider label="Adaptive whisper lift" value={settings.whisperLift} onChange={(v) => setSetting("whisperLift", v)}/>
-          <div className="chain"><span>HPF</span><ChevronRight/><span>HUM</span><ChevronRight/><span>DE-MUFFLE</span><ChevronRight/><span>EXPAND</span><ChevronRight/><span>LIMIT</span></div>
+          <div className="chain"><span>RNNOISE</span><ChevronRight/><span>SPECTRAL</span><ChevronRight/><span>DE-MUFFLE</span><ChevronRight/><span>LIFT</span><ChevronRight/><span>LIMIT</span></div>
           <button className="focus-preset" onClick={applySpeechFocus}><Focus/><span><b>Speech Focus preset</b><small>Strong clarity + RNNoise</small></span></button>
-          <button aria-pressed={focus.whisperRecovery} className={focus.whisperRecovery ? "focus-preset whisper-preset active" : "focus-preset whisper-preset"} onClick={applyWhisperRecovery}><Ear/><span><b>Whisper Recovery {focus.whisperRecovery ? "on" : "preset"}</b><small>Voice-gated lift without broad noise amplification</small></span></button>
+          <button aria-pressed={focus.whisperRecovery} disabled={!engine.analysis} className={focus.whisperRecovery ? "focus-preset whisper-preset active" : "focus-preset whisper-preset"} onClick={applyWhisperRecovery}><Ear/><span><b>Whisper Recovery {focus.whisperRecovery ? "on" : "mode"}</b><small>Learn noise spectrum → subtract noise → lift detected whispers</small></span></button>
           <div className="focus-tools">
             <button onClick={learnNoiseProfile} disabled={!engine.analysis}><ScanLine/><span><b>Learn noise profile</b><small>{noiseHint}</small></span></button>
-            <label className="feature-toggle"><span><b>Use learned profile</b><small>{focus.noiseFloor === null ? "Learn a quiet region first" : !focus.noiseProfileEnabled ? `Ready · ${noiseConfidence}% confidence` : !settings.enabled ? "Paused in Original/A" : engine.noiseReductionDb > 0.1 ? `Reducing ${engine.noiseReductionDb.toFixed(1)} dB now` : `Active · monitoring · ${noiseConfidence}% confidence`}</small></span><button role="switch" aria-label="Use learned noise profile" aria-checked={focus.noiseProfileEnabled} className={focus.noiseProfileEnabled ? "toggle on" : "toggle"} onClick={() => setNoiseProfileEnabled(!focus.noiseProfileEnabled)} disabled={focus.noiseFloor === null}><i/></button></label>
+            <label className="feature-toggle"><span><b>Use spectral noise profile</b><small>{focus.noiseFloor === null ? "Learn a quiet region first" : !focus.noiseProfileEnabled ? `Ready · ${noiseConfidence}% confidence` : !settings.enabled ? "Paused in Original/A" : engine.spectralStatus === "error" ? "Spectral worklet unavailable · RNNoise remains active" : engine.noiseReductionDb > 0.1 ? `Subtracting ${engine.noiseReductionDb.toFixed(1)} dB now` : `Fingerprint active · ${noiseConfidence}% confidence`}</small></span><button role="switch" aria-label="Use learned noise profile" aria-checked={focus.noiseProfileEnabled} className={focus.noiseProfileEnabled ? "toggle on" : "toggle"} onClick={() => setNoiseProfileEnabled(!focus.noiseProfileEnabled)} disabled={focus.noiseFloor === null || !focus.noiseSpectrum?.length}><i/></button></label>
             {focus.noiseFloor !== null ? <button className="noise-reset" onClick={resetNoiseProfile}><RotateCcw/><span><b>Reset noise profile</b><small>Forget the learned threshold</small></span></button> : null}
             <label className="feature-toggle"><span><b>Voice-only playback</b><small>Skips detected non-speech</small></span><button role="switch" aria-label="Voice-only playback" aria-checked={focus.voiceOnly} className={focus.voiceOnly ? "toggle on" : "toggle"} onClick={() => setFocus((old) => ({ ...old, voiceOnly: !old.voiceOnly }))} disabled={!ready}><i/></button></label>
           </div>
@@ -427,8 +458,8 @@ export function VoiceScope() {
 
         <div className="inspector-title transcript-title"><Captions/><span>LOCAL TRANSCRIPT</span></div>
         <div className="transcript-card">
-          <label className="transcript-language"><Languages/><span><b>Spoken language</b><small>Choose a language for muffled audio</small></span><select value={transcriptLanguage} disabled={transcriptBusy} onChange={(event) => { const language = event.target.value as TranscriptLanguage; setTranscriptLanguage(language); if (transcriptionEnabled) void startTranscription(language); }}><option value="auto">Auto detect</option><option value="en">English</option><option value="hi">हिन्दी · Hindi</option><option value="mr">मराठी · Marathi</option></select></label>
-          <div className="feature-toggle"><span><b>Whisper transcription</b><small>English · Hindi · Marathi · word timestamps</small></span><button role="switch" aria-label="Whisper transcription" aria-checked={transcriptionEnabled} className={transcriptionEnabled ? "toggle on" : "toggle"} onClick={() => { if (transcriptionEnabled) stopTranscription(); else void startTranscription(); }} disabled={!ready}><i/></button></div>
+          <label className="transcript-language"><Languages/><span><b>Language strategy</b><small>Adaptive mode re-detects across the recording</small></span><select value={transcriptLanguage} disabled={transcriptBusy} onChange={(event) => { const language = event.target.value as TranscriptLanguage; setTranscriptLanguage(language); if (transcriptionEnabled) void startTranscription(language); }}><option value="auto">Adaptive multilingual · Hinglish</option><option value="en">Force English</option><option value="hi">हिन्दी · Force Hindi</option><option value="mr">मराठी · Force Marathi</option></select></label>
+          <div className="feature-toggle"><span><b>Whisper transcription</b><small>Uses active enhancement + word timestamps</small></span><button role="switch" aria-label="Whisper transcription" aria-checked={transcriptionEnabled} className={transcriptionEnabled ? "toggle on" : "toggle"} onClick={() => { if (transcriptionEnabled) stopTranscription(); else void startTranscription(); }} disabled={!ready}><i/></button></div>
           {transcriptionEnabled && <>
             <div className="transcript-progress"><i style={{ width: `${transcriptProgress * 100}%` }}/></div>
             <p className="transcript-status">{transcriptStatus}</p>
